@@ -68,11 +68,7 @@ QUEUES = [
 
 ]
 
-# Перевірка графіка кожні 5 хвилин
-
 CHECK_INTERVAL = 300
-
-# Попередження перед відключенням
 
 WARNING_MINUTES = 30
 
@@ -150,13 +146,7 @@ async def init_database():
 
         """)
 
-    print(
-
-        "PostgreSQL database initialized",
-
-        flush=True
-
-    )
+    print("PostgreSQL database initialized", flush=True)
 
 async def get_user(user_id):
 
@@ -462,11 +452,23 @@ def main_keyboard(notifications_enabled=True):
 
                 InlineKeyboardButton(
 
+                    text="✨ Мій день",
+
+                    callback_data="my_day"
+
+                ),
+
+                InlineKeyboardButton(
+
                     text="📆 Завтра",
 
                     callback_data="tomorrow"
 
                 ),
+
+            ],
+
+            [
 
                 InlineKeyboardButton(
 
@@ -490,6 +492,18 @@ def main_keyboard(notifications_enabled=True):
 
             ],
 
+            [
+
+                InlineKeyboardButton(
+
+                    text="🖕 Послати нах*й русню!",
+
+                    callback_data="send_rusnya"
+
+                )
+
+            ],
+
         ]
 
     )
@@ -500,15 +514,7 @@ def main_keyboard(notifications_enabled=True):
 
 # =========================================================
 
-async def safe_edit(
-
-    message,
-
-    text,
-
-    reply_markup=None
-
-):
+async def safe_edit(message, text, reply_markup=None):
 
     try:
 
@@ -527,18 +533,6 @@ async def safe_edit(
             return
 
         raise
-
-async def get_main_keyboard_for_user(user_id):
-
-    user = await get_user(user_id)
-
-    enabled = True
-
-    if user is not None:
-
-        enabled = bool(user["notifications"])
-
-    return main_keyboard(enabled)
 
 # =========================================================
 
@@ -710,25 +704,13 @@ def get_periods(day_data, queue):
 
         return []
 
-    queues = day_data.get(
-
-        "queues",
-
-        {}
-
-    )
+    queues = day_data.get("queues", {})
 
     if not isinstance(queues, dict):
 
         return []
 
-    periods = queues.get(
-
-        queue,
-
-        []
-
-    )
+    periods = queues.get(queue, [])
 
     if not isinstance(periods, list):
 
@@ -797,6 +779,60 @@ def minutes_until(time_value, now):
     )
 
     return target - current
+
+def duration_minutes(period):
+
+    start = time_to_minutes(
+
+        period.get("from", "00:00")
+
+    )
+
+    end = time_to_minutes(
+
+        period.get("to", "00:00")
+
+    )
+
+    if end == 0 and start > 0:
+
+        end = 24 * 60
+
+    if end < start:
+
+        end += 24 * 60
+
+    return max(
+
+        0,
+
+        end - start
+
+    )
+
+def human_duration(minutes):
+
+    minutes = max(
+
+        0,
+
+        int(minutes)
+
+    )
+
+    hours = minutes // 60
+
+    mins = minutes % 60
+
+    if hours and mins:
+
+        return f"{hours} год {mins} хв"
+
+    if hours:
+
+        return f"{hours} год"
+
+    return f"{mins} хв"
 
 # =========================================================
 
@@ -1166,6 +1202,408 @@ def format_current(day_data, queue):
 
 # =========================================================
 
+# МІЙ ДЕНЬ
+
+# =========================================================
+
+def format_my_day(day_data, queue):
+
+    if not day_data:
+
+        return (
+
+            "<b>✨ Мій день</b>\n"
+
+            f"Підчерга: <b>{queue}</b>\n\n"
+
+            "🟢 <b>Активний графік ГПВ "
+
+            "на сьогодні не опублікований.</b>\n\n"
+
+            "На цей момент немає даних для "
+
+            "розрахунку відключень на день.\n\n"
+
+            "Як тільки Прикарпаттяобленерго "
+
+            "опублікує графік, тут з'явиться "
+
+            "короткий аналіз вашого дня.\n\n"
+
+            "Джерело: Прикарпаттяобленерго"
+
+        )
+
+    periods = get_periods(
+
+        day_data,
+
+        queue
+
+    )
+
+    if not periods:
+
+        return (
+
+            "<b>✨ Мій день</b>\n"
+
+            f"Підчерга: <b>{queue}</b>\n\n"
+
+            "🟢 <b>На сьогодні запланованих "
+
+            "вимкнень не знайдено.</b>\n\n"
+
+            "Джерело: Прикарпаттяобленерго"
+
+        )
+
+    now = datetime.now(TZ)
+
+    lines = [
+
+        "<b>✨ Мій день</b>",
+
+        f"Підчерга: <b>{queue}</b>",
+
+        "",
+
+    ]
+
+    outage_minutes = 0
+
+    possible_minutes = 0
+
+    longest_light_minutes = 0
+
+    longest_light_period = None
+
+    next_outage = None
+
+    next_outage_remaining = None
+
+    for period in periods:
+
+        lines.append(
+
+            format_period(period)
+
+        )
+
+        status = parse_status(
+
+            period.get("status", 0)
+
+        )
+
+        duration = duration_minutes(
+
+            period
+
+        )
+
+        if status == 1:
+
+            outage_minutes += duration
+
+        elif status != 0:
+
+            possible_minutes += duration
+
+        else:
+
+            if duration > longest_light_minutes:
+
+                longest_light_minutes = duration
+
+                longest_light_period = period
+
+        if status != 0:
+
+            start = period.get("from")
+
+            if start:
+
+                remaining = minutes_until(
+
+                    start,
+
+                    now
+
+                )
+
+                if remaining > 0:
+
+                    if (
+
+                        next_outage_remaining is None
+
+                        or remaining < next_outage_remaining
+
+                    ):
+
+                        next_outage_remaining = remaining
+
+                        next_outage = period
+
+    lines.extend([
+
+        "",
+
+        "────────────",
+
+        "",
+
+        "<b>📊 Підсумок дня</b>",
+
+    ])
+
+    if outage_minutes > 0:
+
+        lines.append(
+
+            "🔴 Без світла за графіком: "
+
+            f"<b>{human_duration(outage_minutes)}</b>"
+
+        )
+
+    else:
+
+        lines.append(
+
+            "🔴 Підтверджених відключень: "
+
+            "<b>немає</b>"
+
+        )
+
+    if possible_minutes > 0:
+
+        lines.append(
+
+            "🟡 Можливі відключення: "
+
+            f"<b>{human_duration(possible_minutes)}</b>"
+
+        )
+
+    if longest_light_period:
+
+        light_start = longest_light_period.get(
+
+            "from",
+
+            "--:--"
+
+        )
+
+        light_end = longest_light_period.get(
+
+            "to",
+
+            "--:--"
+
+        )
+
+        lines.extend([
+
+            "",
+
+            "☀️ Найдовший період зі світлом:",
+
+            f"<b>{light_start}–{light_end}</b> "
+
+            f"({human_duration(longest_light_minutes)})"
+
+        ])
+
+    lines.append("")
+
+    if next_outage:
+
+        next_start = next_outage.get(
+
+            "from",
+
+            "--:--"
+
+        )
+
+        next_end = next_outage.get(
+
+            "to",
+
+            "--:--"
+
+        )
+
+        next_status = parse_status(
+
+            next_outage.get(
+
+                "status",
+
+                0
+
+            )
+
+        )
+
+        if next_status == 1:
+
+            heading = (
+
+                "⚠️ Наступне відключення"
+
+            )
+
+        else:
+
+            heading = (
+
+                "⚠️ Наступне можливе відключення"
+
+            )
+
+        lines.extend([
+
+            f"<b>{heading}</b>",
+
+            f"🕐 {next_start}–{next_end}",
+
+            "⏳ До початку: "
+
+            f"<b>{human_duration(next_outage_remaining)}</b>",
+
+        ])
+
+        if next_outage_remaining <= 30:
+
+            lines.extend([
+
+                "",
+
+                "🔋 <b>Час перевірити заряд "
+
+                "телефону та павербанка.</b>"
+
+            ])
+
+        elif next_outage_remaining <= 120:
+
+            lines.extend([
+
+                "",
+
+                "🔌 Ще є час зарядити "
+
+                "необхідні пристрої."
+
+            ])
+
+    else:
+
+        current_outage = None
+
+        for period in periods:
+
+            status = parse_status(
+
+                period.get(
+
+                    "status",
+
+                    0
+
+                )
+
+            )
+
+            if (
+
+                status != 0
+
+                and period_contains_now(
+
+                    period,
+
+                    now
+
+                )
+
+            ):
+
+                current_outage = period
+
+                break
+
+        if current_outage:
+
+            end = current_outage.get(
+
+                "to",
+
+                "--:--"
+
+            )
+
+            lines.extend([
+
+                "⚠️ <b>Зараз триває період "
+
+                "відключення за графіком.</b>",
+
+                f"Орієнтовно до: <b>{end}</b>"
+
+            ])
+
+        else:
+
+            lines.append(
+
+                "✅ <b>На сьогодні наступних "
+
+                "відключень за графіком немає.</b>"
+
+            )
+
+    approved = day_data.get(
+
+        "scheduleApprovedSince"
+
+    )
+
+    if approved:
+
+        lines.extend([
+
+            "",
+
+            f"🕐 Графік оновлено: {approved}"
+
+        ])
+
+    lines.extend([
+
+        "",
+
+        "⚠️ Дані розраховані за опублікованим "
+
+        "графіком і не показують аварійні "
+
+        "відключення.",
+
+        "",
+
+        "Джерело: Прикарпаттяобленерго"
+
+    ])
+
+    return "\n".join(lines)
+
+# =========================================================
+
 # ОТРИМАННЯ ТЕКСТУ ГРАФІКА
 
 # =========================================================
@@ -1185,6 +1623,16 @@ async def build_schedule_text(
     )
 
     if not data:
+
+        if mode == "my_day":
+
+            return format_my_day(
+
+                None,
+
+                queue
+
+            )
 
         return no_active_schedule_text(
 
@@ -1233,6 +1681,24 @@ async def build_schedule_text(
             "📅 Графік на сьогодні",
 
             "today"
+
+        )
+
+    if mode == "my_day":
+
+        day_data = find_day(
+
+            data,
+
+            now.date()
+
+        )
+
+        return format_my_day(
+
+            day_data,
+
+            queue
 
         )
 
@@ -1315,12 +1781,6 @@ async def notify_schedule_change(
         queue
 
     )
-
-    # Перший запуск:
-
-    # просто запам'ятовуємо поточний стан,
-
-    # щоб не розіслати старий графік усім.
 
     if old_hash is None:
 
@@ -1548,15 +2008,15 @@ async def check_upcoming_outages(
 
         status = parse_status(
 
-            period.get("status", 0)
+            period.get(
+
+                "status",
+
+                0
+
+            )
 
         )
-
-        # 0 трактуємо як період без ГПВ.
-
-        # Інші значення поки логуються,
-
-        # доки не перевіримо їх на живому графіку.
 
         if status == 0:
 
@@ -1592,17 +2052,13 @@ async def check_upcoming_outages(
 
         )
 
-        # Ширше вікно, щоб 5-хвилинний цикл
+        # Попереджаємо при першій перевірці
 
-        # не пропустив попередження.
+        # в останні 30 хв до початку.
 
         if not (
 
-            WARNING_MINUTES - 5
-
-            <= remaining
-
-            <= WARNING_MINUTES
+            0 < remaining <= WARNING_MINUTES
 
         ):
 
@@ -1669,6 +2125,10 @@ async def check_upcoming_outages(
                 f"До початку приблизно "
 
                 f"<b>{remaining} хв.</b>\n\n"
+
+                "🔋 Перевірте заряд телефону "
+
+                "та павербанка.\n\n"
 
                 "Джерело: Прикарпаттяобленерго"
 
@@ -1808,7 +2268,13 @@ async def schedule_monitor(bot):
 
 # =========================================================
 
-async def show_main_menu(message, user_id):
+async def show_main_menu(
+
+    message,
+
+    user_id
+
+):
 
     user = await get_user(
 
@@ -1862,7 +2328,11 @@ async def show_main_menu(message, user_id):
 
 @router.message(CommandStart())
 
-async def start_command(message: Message):
+async def start_command(
+
+    message: Message
+
+):
 
     await show_main_menu(
 
@@ -1874,7 +2344,7 @@ async def start_command(message: Message):
 
 # =========================================================
 
-# /STATUS /TODAY /TOMORROW
+# КОМАНДИ ГРАФІКА
 
 # =========================================================
 
@@ -1958,7 +2428,11 @@ async def command_schedule(
 
 @router.message(Command("status"))
 
-async def status_command(message: Message):
+async def status_command(
+
+    message: Message
+
+):
 
     await command_schedule(
 
@@ -1970,7 +2444,11 @@ async def status_command(message: Message):
 
 @router.message(Command("today"))
 
-async def today_command(message: Message):
+async def today_command(
+
+    message: Message
+
+):
 
     await command_schedule(
 
@@ -1982,13 +2460,33 @@ async def today_command(message: Message):
 
 @router.message(Command("tomorrow"))
 
-async def tomorrow_command(message: Message):
+async def tomorrow_command(
+
+    message: Message
+
+):
 
     await command_schedule(
 
         message,
 
         "tomorrow"
+
+    )
+
+@router.message(Command("myday"))
+
+async def my_day_command(
+
+    message: Message
+
+):
+
+    await command_schedule(
+
+        message,
+
+        "my_day"
 
     )
 
@@ -2000,7 +2498,11 @@ async def tomorrow_command(message: Message):
 
 @router.message(Command("queue"))
 
-async def queue_command(message: Message):
+async def queue_command(
+
+    message: Message
+
+):
 
     await message.answer(
 
@@ -2312,7 +2814,7 @@ async def notifications_callback(
 
 # =========================================================
 
-# CALLBACK: ГРАФІК
+# CALLBACK: ГРАФІК + МІЙ ДЕНЬ
 
 # =========================================================
 
@@ -2324,7 +2826,9 @@ async def notifications_callback(
 
         "today",
 
-        "tomorrow"
+        "tomorrow",
+
+        "my_day",
 
     })
 
@@ -2422,6 +2926,56 @@ async def schedule_callback(
 
 # =========================================================
 
+# CALLBACK: ПОСЛАТИ РУСНЮ
+
+# =========================================================
+
+@router.callback_query(
+
+    F.data == "send_rusnya"
+
+)
+
+async def send_rusnya_callback(
+
+    callback: CallbackQuery
+
+):
+
+    await callback.answer()
+
+    user = await get_user(
+
+        callback.from_user.id
+
+    )
+
+    notifications_enabled = True
+
+    if user is not None:
+
+        notifications_enabled = bool(
+
+            user["notifications"]
+
+        )
+
+    await safe_edit(
+
+        callback.message,
+
+        "🖕 <b>Ок, шлемо нах*й</b>",
+
+        main_keyboard(
+
+            notifications_enabled
+
+        )
+
+    )
+
+# =========================================================
+
 # HEALTH CHECK ДЛЯ RENDER
 
 # =========================================================
@@ -2452,11 +3006,7 @@ async def main():
 
     )
 
-    # PostgreSQL / Supabase
-
     await init_database()
-
-    # HTTP-сесія для API
 
     http_session = ClientSession(
 
@@ -2467,8 +3017,6 @@ async def main():
         )
 
     )
-
-    # Health server для Render
 
     app = web.Application()
 
@@ -2519,8 +3067,6 @@ async def main():
         flush=True
 
     )
-
-    # Telegram bot
 
     bot = Bot(
 
