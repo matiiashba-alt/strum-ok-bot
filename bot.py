@@ -2737,4 +2737,166 @@ async def broadcast_draft_message(
         "waiting": False,
         "chat_id": message.chat.id,
         "message_id": message.message_id,
-   
+    }
+
+    await message.answer(
+        "👁 <b>Попередній перегляд:</b>"
+    )
+
+    try:
+
+        await message.bot.copy_message(
+            chat_id=message.chat.id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id
+        )
+
+    except Exception as error:
+
+        print(
+            "BROADCAST PREVIEW ERROR:",
+            repr(error),
+            flush=True
+        )
+
+        broadcast_drafts.pop(
+            message.from_user.id,
+            None
+        )
+
+        await message.answer(
+            "❌ Не вдалося підготувати "
+            "це повідомлення для розсилки.\n\n"
+            "Спробуйте інше повідомлення.",
+            reply_markup=admin_keyboard()
+        )
+
+        return
+
+    users = await get_all_user_ids()
+
+    await message.answer(
+        (
+            "📢 <b>Готово до розсилки</b>\n\n"
+            f"👥 Користувачів у базі: "
+            f"<b>{len(users)}</b>\n\n"
+            "Надіслати це повідомлення "
+            "всім користувачам?"
+        ),
+        reply_markup=broadcast_confirm_keyboard()
+    )
+
+
+# =========================================================
+# HEALTH CHECK ДЛЯ RENDER
+# =========================================================
+
+async def health(request):
+
+    return web.Response(
+        text="Strum OK is running"
+    )
+
+
+# =========================================================
+# ЗАПУСК
+# =========================================================
+
+async def main():
+
+    global http_session
+
+    print(
+        "Starting Strum OK...",
+        flush=True
+    )
+
+    await init_database()
+
+    http_session = ClientSession(
+        timeout=ClientTimeout(
+            total=15
+        )
+    )
+
+    app = web.Application()
+
+    app.router.add_get(
+        "/",
+        health
+    )
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    port = int(
+        os.getenv(
+            "PORT",
+            10000
+        )
+    )
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        port
+    )
+
+    await site.start()
+
+    print(
+        f"Health server started on port {port}",
+        flush=True
+    )
+
+    bot = Bot(
+        TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        )
+    )
+
+    dp = Dispatcher()
+
+    dp.include_router(
+        router
+    )
+
+    monitor_task = asyncio.create_task(
+        schedule_monitor(bot)
+    )
+
+    print(
+        "Strum OK bot started",
+        flush=True
+    )
+
+    try:
+
+        await dp.start_polling(
+            bot
+        )
+
+    finally:
+
+        monitor_task.cancel()
+
+        try:
+            await monitor_task
+
+        except asyncio.CancelledError:
+            pass
+
+        if http_session:
+            await http_session.close()
+
+        if db_pool:
+            await db_pool.close()
+
+        await bot.session.close()
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
