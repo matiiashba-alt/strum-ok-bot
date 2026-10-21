@@ -2,21 +2,21 @@ import asyncio
 
 import os
 
-import sqlite3
+import json
 
 import hashlib
-
-import json
 
 from datetime import datetime, timedelta
 
 from zoneinfo import ZoneInfo
 
+import asyncpg
+
 from aiohttp import web, ClientSession, ClientTimeout
 
 from aiogram import Bot, Dispatcher, F, Router
 
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 
 from aiogram.types import (
 
@@ -44,9 +44,15 @@ from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = os.getenv("BOT_TOKEN")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not TOKEN:
 
     raise RuntimeError("BOT_TOKEN environment variable is not set")
+
+if not DATABASE_URL:
+
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
 TZ = ZoneInfo("Europe/Kyiv")
 
@@ -62,163 +68,313 @@ QUEUES = [
 
 ]
 
-# Як часто перевіряємо графік
+# Перевірка графіка кожні 5 хвилин
 
-CHECK_INTERVAL = 300  # 5 хвилин
+CHECK_INTERVAL = 300
 
-# За скільки хвилин попереджати
+# Попередження перед відключенням
 
 WARNING_MINUTES = 30
 
 router = Router()
 
+db_pool = None
+
+http_session = None
+
 # =========================================================
 
-# БАЗА ДАНИХ
+# POSTGRESQL / SUPABASE
 
 # =========================================================
 
-db = sqlite3.connect(
+async def init_database():
 
-    "strum_ok.db",
+    global db_pool
 
-    check_same_thread=False
+    db_pool = await asyncpg.create_pool(
 
-)
+        DATABASE_URL,
 
-db.execute("""
+        min_size=1,
 
-CREATE TABLE IF NOT EXISTS users (
+        max_size=5,
 
-    telegram_id INTEGER PRIMARY KEY,
-
-    queue TEXT,
-
-    notifications INTEGER NOT NULL DEFAULT 1,
-
-    created_at TEXT NOT NULL
-
-)
-
-""")
-
-db.execute("""
-
-CREATE TABLE IF NOT EXISTS sent_notifications (
-
-    notification_key TEXT PRIMARY KEY,
-
-    sent_at TEXT NOT NULL
-
-)
-
-""")
-
-db.execute("""
-
-CREATE TABLE IF NOT EXISTS schedule_cache (
-
-    queue TEXT PRIMARY KEY,
-
-    schedule_hash TEXT,
-
-    updated_at TEXT
-
-)
-
-""")
-
-db.commit()
-
-def get_user(user_id):
-
-    return db.execute(
-
-        """
-
-        SELECT queue, notifications
-
-        FROM users
-
-        WHERE telegram_id=?
-
-        """,
-
-        (user_id,)
-
-    ).fetchone()
-
-def get_notification_users():
-
-    return db.execute(
-
-        """
-
-        SELECT telegram_id, queue
-
-        FROM users
-
-        WHERE notifications=1
-
-        AND queue IS NOT NULL
-
-        """
-
-    ).fetchall()
-
-def notification_was_sent(key):
-
-    row = db.execute(
-
-        """
-
-        SELECT notification_key
-
-        FROM sent_notifications
-
-        WHERE notification_key=?
-
-        """,
-
-        (key,)
-
-    ).fetchone()
-
-    return row is not None
-
-def mark_notification_sent(key):
-
-    db.execute(
-
-        """
-
-        INSERT OR IGNORE INTO sent_notifications (
-
-            notification_key,
-
-            sent_at
-
-        )
-
-        VALUES (?, ?)
-
-        """,
-
-        (
-
-            key,
-
-            datetime.now(TZ).isoformat()
-
-        )
+        command_timeout=30,
 
     )
 
-    db.commit()
+    async with db_pool.acquire() as conn:
+
+        await conn.execute("""
+
+            CREATE TABLE IF NOT EXISTS users (
+
+                telegram_id BIGINT PRIMARY KEY,
+
+                queue TEXT,
+
+                notifications BOOLEAN NOT NULL DEFAULT TRUE,
+
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+            )
+
+        """)
+
+        await conn.execute("""
+
+            CREATE TABLE IF NOT EXISTS sent_notifications (
+
+                notification_key TEXT PRIMARY KEY,
+
+                sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+            )
+
+        """)
+
+        await conn.execute("""
+
+            CREATE TABLE IF NOT EXISTS schedule_cache (
+
+                queue TEXT PRIMARY KEY,
+
+                schedule_hash TEXT,
+
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+            )
+
+        """)
+
+    print(
+
+        "PostgreSQL database initialized",
+
+        flush=True
+
+    )
+
+async def get_user(user_id):
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+
+            """
+
+            SELECT queue, notifications
+
+            FROM users
+
+            WHERE telegram_id=$1
+
+            """,
+
+            user_id,
+
+        )
+
+    return row
+
+async def save_user_queue(user_id, queue):
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+
+            """
+
+            INSERT INTO users (
+
+                telegram_id,
+
+                queue,
+
+                notifications,
+
+                created_at,
+
+                updated_at
+
+            )
+
+            VALUES ($1, $2, TRUE, NOW(), NOW())
+
+            ON CONFLICT (telegram_id)
+
+            DO UPDATE SET
+
+                queue=EXCLUDED.queue,
+
+                updated_at=NOW()
+
+            """,
+
+            user_id,
+
+            queue,
+
+        )
+
+async def set_notifications(user_id, value):
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+
+            """
+
+            UPDATE users
+
+            SET notifications=$1,
+
+                updated_at=NOW()
+
+            WHERE telegram_id=$2
+
+            """,
+
+            value,
+
+            user_id,
+
+        )
+
+async def get_notification_users():
+
+    async with db_pool.acquire() as conn:
+
+        rows = await conn.fetch(
+
+            """
+
+            SELECT telegram_id, queue
+
+            FROM users
+
+            WHERE notifications=TRUE
+
+              AND queue IS NOT NULL
+
+            """
+
+        )
+
+    return rows
+
+async def notification_was_sent(key):
+
+    async with db_pool.acquire() as conn:
+
+        row = await conn.fetchrow(
+
+            """
+
+            SELECT notification_key
+
+            FROM sent_notifications
+
+            WHERE notification_key=$1
+
+            """,
+
+            key,
+
+        )
+
+    return row is not None
+
+async def mark_notification_sent(key):
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+
+            """
+
+            INSERT INTO sent_notifications (
+
+                notification_key,
+
+                sent_at
+
+            )
+
+            VALUES ($1, NOW())
+
+            ON CONFLICT (notification_key)
+
+            DO NOTHING
+
+            """,
+
+            key,
+
+        )
+
+async def get_cached_schedule_hash(queue):
+
+    async with db_pool.acquire() as conn:
+
+        return await conn.fetchval(
+
+            """
+
+            SELECT schedule_hash
+
+            FROM schedule_cache
+
+            WHERE queue=$1
+
+            """,
+
+            queue,
+
+        )
+
+async def save_schedule_hash(queue, schedule_hash):
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+
+            """
+
+            INSERT INTO schedule_cache (
+
+                queue,
+
+                schedule_hash,
+
+                updated_at
+
+            )
+
+            VALUES ($1, $2, NOW())
+
+            ON CONFLICT (queue)
+
+            DO UPDATE SET
+
+                schedule_hash=EXCLUDED.schedule_hash,
+
+                updated_at=NOW()
+
+            """,
+
+            queue,
+
+            schedule_hash,
+
+        )
 
 # =========================================================
 
-# КНОПКИ
+# КЛАВІАТУРИ
 
 # =========================================================
 
@@ -266,7 +422,17 @@ def queue_keyboard():
 
     )
 
-def main_keyboard():
+def main_keyboard(notifications_enabled=True):
+
+    notification_text = (
+
+        "🔔 Сповіщення: УВІМК."
+
+        if notifications_enabled
+
+        else "🔕 Сповіщення: ВИМК."
+
+    )
 
     return InlineKeyboardMarkup(
 
@@ -316,23 +482,11 @@ def main_keyboard():
 
                 InlineKeyboardButton(
 
-                    text="🔔 Сповіщення",
+                    text=notification_text,
 
                     callback_data="notifications"
 
-                ),
-
-            ],
-
-            [
-
-                InlineKeyboardButton(
-
-                    text="🧪 Тест сповіщення",
-
-                    callback_data="test_notification"
-
-                ),
+                )
 
             ],
 
@@ -342,11 +496,19 @@ def main_keyboard():
 
 # =========================================================
 
-# БЕЗПЕЧНЕ РЕДАГУВАННЯ TELEGRAM
+# TELEGRAM HELPERS
 
 # =========================================================
 
-async def safe_edit(message, text, reply_markup=None):
+async def safe_edit(
+
+    message,
+
+    text,
+
+    reply_markup=None
+
+):
 
     try:
 
@@ -366,6 +528,18 @@ async def safe_edit(message, text, reply_markup=None):
 
         raise
 
+async def get_main_keyboard_for_user(user_id):
+
+    user = await get_user(user_id)
+
+    enabled = True
+
+    if user is not None:
+
+        enabled = bool(user["notifications"])
+
+    return main_keyboard(enabled)
+
 # =========================================================
 
 # API ПРИКАРПАТТЯОБЛЕНЕРГО
@@ -373,6 +547,8 @@ async def safe_edit(message, text, reply_markup=None):
 # =========================================================
 
 async def fetch_schedule(queue):
+
+    global http_session
 
     headers = {
 
@@ -398,59 +574,55 @@ async def fetch_schedule(queue):
 
     }
 
-    timeout = ClientTimeout(total=15)
+    async with http_session.get(
 
-    async with ClientSession(timeout=timeout) as session:
+        SCHEDULE_URL,
 
-        async with session.get(
+        params={"queue": queue},
 
-            SCHEDULE_URL,
+        headers=headers,
 
-            params={"queue": queue},
+    ) as response:
 
-            headers=headers
+        print(
 
-        ) as response:
+            f"SCHEDULE {queue} STATUS:",
 
-            print(
+            response.status,
 
-                f"SCHEDULE {queue} STATUS:",
+            flush=True
 
-                response.status,
+        )
 
-                flush=True
+        if response.status != 200:
 
-            )
+            raise RuntimeError(
 
-            if response.status != 200:
-
-                raise RuntimeError(
-
-                    f"Schedule server returned {response.status}"
-
-                )
-
-            data = await response.json(
-
-                content_type=None
+                f"Schedule server returned HTTP {response.status}"
 
             )
 
-            print(
+        data = await response.json(
 
-                f"SCHEDULE {queue} DATA:",
+            content_type=None
 
-                data,
+        )
 
-                flush=True
+        print(
 
-            )
+            f"SCHEDULE {queue} DATA:",
 
-            return data
+            data,
+
+            flush=True
+
+        )
+
+        return data
 
 # =========================================================
 
-# РОБОТА З ДАТАМИ
+# ДАТИ / ЧАС
 
 # =========================================================
 
@@ -538,13 +710,25 @@ def get_periods(day_data, queue):
 
         return []
 
-    queues = day_data.get("queues", {})
+    queues = day_data.get(
+
+        "queues",
+
+        {}
+
+    )
 
     if not isinstance(queues, dict):
 
         return []
 
-    periods = queues.get(queue, [])
+    periods = queues.get(
+
+        queue,
+
+        []
+
+    )
 
     if not isinstance(periods, list):
 
@@ -556,9 +740,13 @@ def time_to_minutes(value):
 
     try:
 
-        hour, minute = str(value).split(":")[:2]
+        parts = str(value).split(":")
 
-        return int(hour) * 60 + int(minute)
+        hour = int(parts[0])
+
+        minute = int(parts[1])
+
+        return hour * 60 + minute
 
     except Exception:
 
@@ -578,7 +766,13 @@ def period_contains_now(period, now):
 
     )
 
-    current = now.hour * 60 + now.minute
+    current = (
+
+        now.hour * 60
+
+        + now.minute
+
+    )
 
     if end == 0 and start > 0:
 
@@ -588,13 +782,13 @@ def period_contains_now(period, now):
 
 def minutes_until(time_value, now):
 
-    target_minutes = time_to_minutes(
+    target = time_to_minutes(
 
         time_value
 
     )
 
-    current_minutes = (
+    current = (
 
         now.hour * 60
 
@@ -602,11 +796,11 @@ def minutes_until(time_value, now):
 
     )
 
-    return target_minutes - current_minutes
+    return target - current
 
 # =========================================================
 
-# СТАТУСИ
+# СТАТУСИ ГРАФІКА
 
 # =========================================================
 
@@ -626,7 +820,7 @@ def status_text(status):
 
     if status == 1:
 
-        return "🔴 Світла немає за графіком"
+        return "🔴 Вимкнення за графіком"
 
     if status != 0:
 
@@ -748,9 +942,11 @@ def no_active_schedule_text(queue, mode):
 
         "на завтра поки не опублікований.</b>\n\n"
 
-        "Якщо буде опублікований новий графік, "
+        "Якщо Прикарпаттяобленерго опублікує "
 
-        "бот автоматично побачить його.\n\n"
+        "новий графік, бот автоматично "
+
+        "побачить зміну.\n\n"
 
         "Джерело: Прикарпаттяобленерго"
 
@@ -758,11 +954,21 @@ def no_active_schedule_text(queue, mode):
 
 # =========================================================
 
-# ГРАФІК НА ДЕНЬ
+# ФОРМАТУВАННЯ ГРАФІКА
 
 # =========================================================
 
-def format_day(day_data, queue, title):
+def format_day(
+
+    day_data,
+
+    queue,
+
+    title,
+
+    mode
+
+):
 
     if not day_data:
 
@@ -770,11 +976,7 @@ def format_day(day_data, queue, title):
 
             queue,
 
-            "today"
-
-            if "сьогодні" in title.lower()
-
-            else "tomorrow"
+            mode
 
         )
 
@@ -841,12 +1043,6 @@ def format_day(day_data, queue, title):
     ])
 
     return "\n".join(lines)
-
-# =========================================================
-
-# СТАН ЗАРАЗ
-
-# =========================================================
 
 def format_current(day_data, queue):
 
@@ -928,11 +1124,13 @@ def format_current(day_data, queue):
 
             f"Підчерга: <b>{queue}</b>\n\n"
 
-            "🟢 <b>Світло має бути</b>\n\n"
+            "🟢 <b>За графіком світло має бути.</b>\n\n"
 
             "На цей час вимкнення "
 
-            "за графіком не заплановане."
+            "за опублікованим графіком "
+
+            "не заплановане."
 
         )
 
@@ -954,13 +1152,115 @@ def format_current(day_data, queue):
 
     text += (
 
-        "\n\nДжерело: "
+        "\n\n⚠️ Це інформація за графіком, "
 
-        "Прикарпаттяобленерго"
+        "а не перевірка фактичної наявності "
+
+        "електроенергії.\n\n"
+
+        "Джерело: Прикарпаттяобленерго"
 
     )
 
     return text
+
+# =========================================================
+
+# ОТРИМАННЯ ТЕКСТУ ГРАФІКА
+
+# =========================================================
+
+async def build_schedule_text(
+
+    queue,
+
+    mode
+
+):
+
+    data = await fetch_schedule(
+
+        queue
+
+    )
+
+    if not data:
+
+        return no_active_schedule_text(
+
+            queue,
+
+            mode
+
+        )
+
+    now = datetime.now(TZ)
+
+    if mode == "status":
+
+        day_data = find_day(
+
+            data,
+
+            now.date()
+
+        )
+
+        return format_current(
+
+            day_data,
+
+            queue
+
+        )
+
+    if mode == "today":
+
+        day_data = find_day(
+
+            data,
+
+            now.date()
+
+        )
+
+        return format_day(
+
+            day_data,
+
+            queue,
+
+            "📅 Графік на сьогодні",
+
+            "today"
+
+        )
+
+    day_data = find_day(
+
+        data,
+
+        (
+
+            now
+
+            + timedelta(days=1)
+
+        ).date()
+
+    )
+
+    return format_day(
+
+        day_data,
+
+        queue,
+
+        "📆 Графік на завтра",
+
+        "tomorrow"
+
+    )
 
 # =========================================================
 
@@ -976,7 +1276,9 @@ def make_schedule_hash(data):
 
         ensure_ascii=False,
 
-        sort_keys=True
+        sort_keys=True,
+
+        separators=(",", ":")
 
     ).encode("utf-8")
 
@@ -988,7 +1290,7 @@ def make_schedule_hash(data):
 
 # =========================================================
 
-# СПОВІЩЕННЯ ПРО НОВИЙ ГРАФІК
+# СПОВІЩЕННЯ ПРО ЗМІНУ ГРАФІКА
 
 # =========================================================
 
@@ -1008,69 +1310,27 @@ async def notify_schedule_change(
 
     )
 
-    row = db.execute(
+    old_hash = await get_cached_schedule_hash(
 
-        """
-
-        SELECT schedule_hash
-
-        FROM schedule_cache
-
-        WHERE queue=?
-
-        """,
-
-        (queue,)
-
-    ).fetchone()
-
-    old_hash = (
-
-        row[0]
-
-        if row
-
-        else None
+        queue
 
     )
 
-    # Перший запуск просто запам'ятовуємо.
+    # Перший запуск:
 
-    # Не спамимо користувачів.
+    # просто запам'ятовуємо поточний стан,
+
+    # щоб не розіслати старий графік усім.
 
     if old_hash is None:
 
-        db.execute(
+        await save_schedule_hash(
 
-            """
+            queue,
 
-            INSERT OR REPLACE INTO schedule_cache (
-
-                queue,
-
-                schedule_hash,
-
-                updated_at
-
-            )
-
-            VALUES (?, ?, ?)
-
-            """,
-
-            (
-
-                queue,
-
-                new_hash,
-
-                datetime.now(TZ).isoformat()
-
-            )
+            new_hash
 
         )
-
-        db.commit()
 
         return
 
@@ -1078,51 +1338,33 @@ async def notify_schedule_change(
 
         return
 
-    db.execute(
+    await save_schedule_hash(
 
-        """
+        queue,
 
-        UPDATE schedule_cache
-
-        SET schedule_hash=?,
-
-            updated_at=?
-
-        WHERE queue=?
-
-        """,
-
-        (
-
-            new_hash,
-
-            datetime.now(TZ).isoformat(),
-
-            queue
-
-        )
+        new_hash
 
     )
 
-    db.commit()
+    async with db_pool.acquire() as conn:
 
-    users = db.execute(
+        users = await conn.fetch(
 
-        """
+            """
 
-        SELECT telegram_id
+            SELECT telegram_id
 
-        FROM users
+            FROM users
 
-        WHERE queue=?
+            WHERE queue=$1
 
-        AND notifications=1
+              AND notifications=TRUE
 
-        """,
+            """,
 
-        (queue,)
+            queue,
 
-    ).fetchall()
+        )
 
     if not users:
 
@@ -1138,33 +1380,81 @@ async def notify_schedule_change(
 
     )
 
+    tomorrow_data = find_day(
+
+        data,
+
+        (
+
+            now
+
+            + timedelta(days=1)
+
+        ).date()
+
+    )
+
     if today_data:
 
-        schedule_text = format_day(
+        body = format_day(
 
             today_data,
 
             queue,
 
-            "📅 Оновлений графік на сьогодні"
+            "📅 Оновлений графік на сьогодні",
+
+            "today"
+
+        )
+
+    elif tomorrow_data:
+
+        body = format_day(
+
+            tomorrow_data,
+
+            queue,
+
+            "📆 Новий графік на завтра",
+
+            "tomorrow"
+
+        )
+
+    elif not data:
+
+        body = (
+
+            f"Підчерга: <b>{queue}</b>\n\n"
+
+            "🟢 Активний графік ГПВ "
+
+            "зараз не опублікований."
 
         )
 
     else:
 
-        schedule_text = (
+        body = (
 
-            "🔔 <b>Струм ОК</b>\n\n"
+            f"Підчерга: <b>{queue}</b>\n\n"
 
             "Прикарпаттяобленерго "
 
-            "оновило інформацію щодо ГПВ.\n\n"
+            "оновило інформацію щодо графіка.\n\n"
 
-            f"Ваша підчерга: <b>{queue}</b>\n\n"
-
-            "Перевірте актуальний графік у боті."
+            "Перевірте актуальні дані в боті."
 
         )
+
+    text = (
+
+        "🔔 <b>Графік оновлено</b>\n\n"
+
+        + body
+
+    )
 
     for user in users:
 
@@ -1172,15 +1462,9 @@ async def notify_schedule_change(
 
             await bot.send_message(
 
-                user[0],
+                user["telegram_id"],
 
-                (
-
-                    "🔔 <b>Графік оновлено</b>\n\n"
-
-                    + schedule_text
-
-                )
+                text
 
             )
 
@@ -1190,7 +1474,7 @@ async def notify_schedule_change(
 
                 "CHANGE NOTIFICATION ERROR:",
 
-                user[0],
+                user["telegram_id"],
 
                 repr(error),
 
@@ -1200,7 +1484,7 @@ async def notify_schedule_change(
 
 # =========================================================
 
-# ПОПЕРЕДЖЕННЯ ЗА 30 ХВ
+# ПОПЕРЕДЖЕННЯ ПЕРЕД ВИМКНЕННЯМ
 
 # =========================================================
 
@@ -1236,23 +1520,25 @@ async def check_upcoming_outages(
 
     )
 
-    users = db.execute(
+    async with db_pool.acquire() as conn:
 
-        """
+        users = await conn.fetch(
 
-        SELECT telegram_id
+            """
 
-        FROM users
+            SELECT telegram_id
 
-        WHERE queue=?
+            FROM users
 
-        AND notifications=1
+            WHERE queue=$1
 
-        """,
+              AND notifications=TRUE
 
-        (queue,)
+            """,
 
-    ).fetchall()
+            queue,
+
+        )
 
     if not users:
 
@@ -1266,15 +1552,33 @@ async def check_upcoming_outages(
 
         )
 
-        # Попереджаємо лише про реальне
+        # 0 трактуємо як період без ГПВ.
 
-        # або можливе вимкнення.
+        # Інші значення поки логуються,
+
+        # доки не перевіримо їх на живому графіку.
 
         if status == 0:
 
             continue
 
+        if status not in (1, 2):
+
+            print(
+
+                "UNKNOWN SCHEDULE STATUS:",
+
+                status,
+
+                period,
+
+                flush=True
+
+            )
+
         start = period.get("from")
+
+        end = period.get("to")
 
         if not start:
 
@@ -1288,13 +1592,13 @@ async def check_upcoming_outages(
 
         )
 
-        # Оскільки перевірка кожні 5 хв,
+        # Ширше вікно, щоб 5-хвилинний цикл
 
-        # беремо невелике вікно.
+        # не пропустив попередження.
 
-        if (
+        if not (
 
-            WARNING_MINUTES - 4
+            WARNING_MINUTES - 5
 
             <= remaining
 
@@ -1302,111 +1606,111 @@ async def check_upcoming_outages(
 
         ):
 
-            end = period.get(
+            continue
 
-                "to",
+        for user in users:
 
-                "--:--"
+            notification_key = (
+
+                f"outage-warning:"
+
+                f"{user['telegram_id']}:"
+
+                f"{now.date()}:"
+
+                f"{queue}:"
+
+                f"{start}:"
+
+                f"{end}:"
+
+                f"{status}"
 
             )
 
-            for user in users:
+            if await notification_was_sent(
 
-                notification_key = (
+                notification_key
 
-                    f"warning:"
+            ):
 
-                    f"{user[0]}:"
+                continue
 
-                    f"{now.date()}:"
+            if status == 1:
 
-                    f"{queue}:"
+                heading = (
 
-                    f"{start}:"
+                    "⚠️ <b>Наближається "
 
-                    f"{end}"
+                    "відключення за графіком</b>"
 
                 )
 
-                if notification_was_sent(
+            else:
+
+                heading = (
+
+                    "⚠️ <b>Наближається період "
+
+                    "можливого відключення</b>"
+
+                )
+
+            text = (
+
+                f"{heading}\n\n"
+
+                f"Підчерга: <b>{queue}</b>\n"
+
+                f"Початок: <b>{start}</b>\n"
+
+                f"До: <b>{end or '--:--'}</b>\n\n"
+
+                f"До початку приблизно "
+
+                f"<b>{remaining} хв.</b>\n\n"
+
+                "Джерело: Прикарпаттяобленерго"
+
+            )
+
+            try:
+
+                await bot.send_message(
+
+                    user["telegram_id"],
+
+                    text
+
+                )
+
+                await mark_notification_sent(
 
                     notification_key
 
-                ):
+                )
 
-                    continue
+            except Exception as error:
 
-                if status == 1:
+                print(
 
-                    warning = (
+                    "WARNING ERROR:",
 
-                        "⚠️ <b>Через 30 хв "
+                    user["telegram_id"],
 
-                        "очікується відключення</b>"
+                    repr(error),
 
-                    )
-
-                else:
-
-                    warning = (
-
-                        "⚠️ <b>Через 30 хв можливе "
-
-                        "відключення</b>"
-
-                    )
-
-                text = (
-
-                    f"{warning}\n\n"
-
-                    f"Підчерга: <b>{queue}</b>\n"
-
-                    f"🕐 {start}–{end}\n\n"
-
-                    "Джерело: Прикарпаттяобленерго"
+                    flush=True
 
                 )
 
-                try:
-
-                    await bot.send_message(
-
-                        user[0],
-
-                        text
-
-                    )
-
-                    mark_notification_sent(
-
-                        notification_key
-
-                    )
-
-                except Exception as error:
-
-                    print(
-
-                        "WARNING ERROR:",
-
-                        user[0],
-
-                        repr(error),
-
-                        flush=True
-
-                    )
-
 # =========================================================
 
-# ФОНОВА ПЕРЕВІРКА
+# ФОНОВИЙ МОНІТОРИНГ
 
 # =========================================================
 
 async def schedule_monitor(bot):
-
-    # Даємо боту нормально запуститися
 
     await asyncio.sleep(10)
 
@@ -1414,19 +1718,19 @@ async def schedule_monitor(bot):
 
         try:
 
-            users = get_notification_users()
+            users = await get_notification_users()
 
             active_queues = sorted(
 
-                set(
+                {
 
-                    user[1]
+                    row["queue"]
 
-                    for user in users
+                    for row in users
 
-                    if user[1]
+                    if row["queue"]
 
-                )
+                }
 
             )
 
@@ -1476,6 +1780,10 @@ async def schedule_monitor(bot):
 
                 await asyncio.sleep(1)
 
+        except asyncio.CancelledError:
+
+            raise
+
         except Exception as error:
 
             print(
@@ -1496,37 +1804,19 @@ async def schedule_monitor(bot):
 
 # =========================================================
 
-# /START
+# ГОЛОВНЕ МЕНЮ
 
 # =========================================================
 
-@router.message(CommandStart())
+async def show_main_menu(message, user_id):
 
-async def start(message: Message):
+    user = await get_user(
 
-    user = get_user(
-
-        message.from_user.id
+        user_id
 
     )
 
-    if user and user[0]:
-
-        await message.answer(
-
-            "⚡ <b>Струм ОК</b>\n\n"
-
-            f"Ваша підчерга: "
-
-            f"<b>{user[0]}</b>\n\n"
-
-            "Оберіть потрібний розділ:",
-
-            reply_markup=main_keyboard()
-
-        )
-
-    else:
+    if not user or not user["queue"]:
 
         await message.answer(
 
@@ -1536,13 +1826,273 @@ async def start(message: Message):
 
             "відключення електроенергії "
 
-            "в Івано-Франківській області.\n\n"
+            "для підчерг Прикарпаттяобленерго.\n\n"
 
             "Оберіть свою підчергу:",
 
             reply_markup=queue_keyboard()
 
         )
+
+        return
+
+    await message.answer(
+
+        "⚡ <b>Струм ОК</b>\n\n"
+
+        f"Ваша підчерга: "
+
+        f"<b>{user['queue']}</b>\n\n"
+
+        "Оберіть потрібний розділ:",
+
+        reply_markup=main_keyboard(
+
+            bool(user["notifications"])
+
+        )
+
+    )
+
+# =========================================================
+
+# /START
+
+# =========================================================
+
+@router.message(CommandStart())
+
+async def start_command(message: Message):
+
+    await show_main_menu(
+
+        message,
+
+        message.from_user.id
+
+    )
+
+# =========================================================
+
+# /STATUS /TODAY /TOMORROW
+
+# =========================================================
+
+async def command_schedule(
+
+    message,
+
+    mode
+
+):
+
+    user = await get_user(
+
+        message.from_user.id
+
+    )
+
+    if not user or not user["queue"]:
+
+        await message.answer(
+
+            "Спочатку оберіть свою підчергу:",
+
+            reply_markup=queue_keyboard()
+
+        )
+
+        return
+
+    try:
+
+        text = await build_schedule_text(
+
+            user["queue"],
+
+            mode
+
+        )
+
+        await message.answer(
+
+            text,
+
+            reply_markup=main_keyboard(
+
+                bool(user["notifications"])
+
+            )
+
+        )
+
+    except Exception as error:
+
+        print(
+
+            "COMMAND SCHEDULE ERROR:",
+
+            repr(error),
+
+            flush=True
+
+        )
+
+        await message.answer(
+
+            "⚠️ <b>Не вдалося отримати графік.</b>\n\n"
+
+            "Сервіс Прикарпаттяобленерго "
+
+            "тимчасово не відповідає.\n\n"
+
+            "Спробуйте ще раз через кілька хвилин.",
+
+            reply_markup=main_keyboard(
+
+                bool(user["notifications"])
+
+            )
+
+        )
+
+@router.message(Command("status"))
+
+async def status_command(message: Message):
+
+    await command_schedule(
+
+        message,
+
+        "status"
+
+    )
+
+@router.message(Command("today"))
+
+async def today_command(message: Message):
+
+    await command_schedule(
+
+        message,
+
+        "today"
+
+    )
+
+@router.message(Command("tomorrow"))
+
+async def tomorrow_command(message: Message):
+
+    await command_schedule(
+
+        message,
+
+        "tomorrow"
+
+    )
+
+# =========================================================
+
+# /QUEUE
+
+# =========================================================
+
+@router.message(Command("queue"))
+
+async def queue_command(message: Message):
+
+    await message.answer(
+
+        "🔄 <b>Зміна підчерги</b>\n\n"
+
+        "Оберіть свою підчергу:",
+
+        reply_markup=queue_keyboard()
+
+    )
+
+# =========================================================
+
+# /NOTIFICATIONS
+
+# =========================================================
+
+@router.message(Command("notifications"))
+
+async def notifications_command(
+
+    message: Message
+
+):
+
+    user = await get_user(
+
+        message.from_user.id
+
+    )
+
+    if not user or not user["queue"]:
+
+        await message.answer(
+
+            "Спочатку оберіть свою підчергу:",
+
+            reply_markup=queue_keyboard()
+
+        )
+
+        return
+
+    new_value = not bool(
+
+        user["notifications"]
+
+    )
+
+    await set_notifications(
+
+        message.from_user.id,
+
+        new_value
+
+    )
+
+    if new_value:
+
+        text = (
+
+            "🔔 <b>Сповіщення увімкнено.</b>\n\n"
+
+            "Бот стежитиме за змінами графіка "
+
+            "для вашої підчерги."
+
+        )
+
+    else:
+
+        text = (
+
+            "🔕 <b>Сповіщення вимкнено.</b>\n\n"
+
+            "Автоматичні повідомлення "
+
+            "надсилатися не будуть."
+
+        )
+
+    await message.answer(
+
+        text,
+
+        reply_markup=main_keyboard(
+
+            new_value
+
+        )
+
+    )
 
 # =========================================================
 
@@ -1582,47 +2132,25 @@ async def choose_queue(
 
         return
 
-    db.execute(
+    await save_user_queue(
 
-        """
+        callback.from_user.id,
 
-        INSERT INTO users (
-
-            telegram_id,
-
-            queue,
-
-            notifications,
-
-            created_at
-
-        )
-
-        VALUES (?, ?, 1, ?)
-
-        ON CONFLICT(telegram_id)
-
-        DO UPDATE SET
-
-            queue=excluded.queue
-
-        """,
-
-        (
-
-            callback.from_user.id,
-
-            queue,
-
-            datetime.now(TZ).isoformat()
-
-        )
+        queue
 
     )
 
-    db.commit()
+    user = await get_user(
 
-    await callback.answer()
+        callback.from_user.id
+
+    )
+
+    await callback.answer(
+
+        "Підчергу збережено ✅"
+
+    )
 
     await safe_edit(
 
@@ -1630,25 +2158,29 @@ async def choose_queue(
 
         (
 
-            "✅ Підчергу збережено: "
+            "✅ <b>Підчергу збережено</b>\n\n"
+
+            f"Ваша підчерга: "
 
             f"<b>{queue}</b>\n\n"
 
-            "🔔 Сповіщення увімкнені.\n\n"
+            "Тепер можна переглядати графік "
 
-            "Тепер бот стежитиме за "
-
-            "вашим графіком."
+            "та отримувати сповіщення."
 
         ),
 
-        main_keyboard()
+        main_keyboard(
+
+            bool(user["notifications"])
+
+        )
 
     )
 
 # =========================================================
 
-# ЗМІНА ПІДЧЕРГИ
+# CALLBACK: ЗМІНИТИ ПІДЧЕРГУ
 
 # =========================================================
 
@@ -1658,7 +2190,7 @@ async def choose_queue(
 
 )
 
-async def change_queue(
+async def change_queue_callback(
 
     callback: CallbackQuery
 
@@ -1670,6 +2202,8 @@ async def change_queue(
 
         callback.message,
 
+        "🔄 <b>Зміна підчерги</b>\n\n"
+
         "Оберіть свою підчергу:",
 
         queue_keyboard()
@@ -1678,7 +2212,7 @@ async def change_queue(
 
 # =========================================================
 
-# УВІМКНУТИ / ВИМКНУТИ СПОВІЩЕННЯ
+# CALLBACK: СПОВІЩЕННЯ
 
 # =========================================================
 
@@ -1688,19 +2222,19 @@ async def change_queue(
 
 )
 
-async def notifications(
+async def notifications_callback(
 
     callback: CallbackQuery
 
 ):
 
-    user = get_user(
+    user = await get_user(
 
         callback.from_user.id
 
     )
 
-    if not user:
+    if not user or not user["queue"]:
 
         await callback.answer(
 
@@ -1712,125 +2246,65 @@ async def notifications(
 
         return
 
-    new_value = (
+    new_value = not bool(
 
-        0
-
-        if user[1]
-
-        else 1
+        user["notifications"]
 
     )
 
-    db.execute(
-
-        """
-
-        UPDATE users
-
-        SET notifications=?
-
-        WHERE telegram_id=?
-
-        """,
-
-        (
-
-            new_value,
-
-            callback.from_user.id
-
-        )
-
-    )
-
-    db.commit()
-
-    if new_value:
-
-        await callback.answer(
-
-            "Сповіщення увімкнено 🔔",
-
-            show_alert=True
-
-        )
-
-    else:
-
-        await callback.answer(
-
-            "Сповіщення вимкнено 🔕",
-
-            show_alert=True
-
-        )
-
-# =========================================================
-
-# ТЕСТ СПОВІЩЕННЯ
-
-# =========================================================
-
-@router.callback_query(
-
-    F.data == "test_notification"
-
-)
-
-async def test_notification(
-
-    callback: CallbackQuery
-
-):
-
-    user = get_user(
-
-        callback.from_user.id
-
-    )
-
-    if not user:
-
-        await callback.answer(
-
-            "Спочатку оберіть підчергу.",
-
-            show_alert=True
-
-        )
-
-        return
-
-    queue = user[0]
-
-    await callback.answer(
-
-        "Тестове сповіщення надіслано ✅"
-
-    )
-
-    await callback.bot.send_message(
+    await set_notifications(
 
         callback.from_user.id,
 
-        (
+        new_value
 
-            "🧪 <b>Тестове сповіщення</b>\n\n"
+    )
 
-            "⚠️ Через 30 хв за графіком "
+    if new_value:
 
-            "очікується відключення "
+        text = (
 
-            "електроенергії.\n\n"
+            "🔔 <b>Сповіщення увімкнено.</b>\n\n"
 
-            f"Підчерга: <b>{queue}</b>\n"
+            f"Підчерга: <b>{user['queue']}</b>\n\n"
 
-            "🕐 20:00–22:00\n\n"
+            "Бот стежитиме за змінами графіка."
 
-            "Це лише тест. "
+        )
 
-            "Реального відключення може не бути."
+        alert = "Сповіщення увімкнено 🔔"
+
+    else:
+
+        text = (
+
+            "🔕 <b>Сповіщення вимкнено.</b>\n\n"
+
+            f"Підчерга: <b>{user['queue']}</b>\n\n"
+
+            "Автоматичні повідомлення "
+
+            "надсилатися не будуть."
+
+        )
+
+        alert = "Сповіщення вимкнено 🔕"
+
+    await callback.answer(
+
+        alert
+
+    )
+
+    await safe_edit(
+
+        callback.message,
+
+        text,
+
+        main_keyboard(
+
+            new_value
 
         )
 
@@ -1838,7 +2312,7 @@ async def test_notification(
 
 # =========================================================
 
-# СТАН / СЬОГОДНІ / ЗАВТРА
+# CALLBACK: ГРАФІК
 
 # =========================================================
 
@@ -1856,19 +2330,19 @@ async def test_notification(
 
 )
 
-async def schedule(
+async def schedule_callback(
 
     callback: CallbackQuery
 
 ):
 
-    user = get_user(
+    user = await get_user(
 
         callback.from_user.id
 
     )
 
-    if not user:
+    if not user or not user["queue"]:
 
         await callback.answer(
 
@@ -1880,97 +2354,17 @@ async def schedule(
 
         return
 
-    queue = user[0]
-
     await callback.answer()
 
     try:
 
-        data = await fetch_schedule(
+        text = await build_schedule_text(
 
-            queue
+            user["queue"],
 
-        )
-
-        if not data:
-
-            text = no_active_schedule_text(
-
-                queue,
-
-                callback.data
-
-            )
-
-            await safe_edit(
-
-                callback.message,
-
-                text,
-
-                main_keyboard()
-
-            )
-
-            return
-
-        now = datetime.now(TZ)
-
-        today_data = find_day(
-
-            data,
-
-            now.date()
+            callback.data
 
         )
-
-        tomorrow_data = find_day(
-
-            data,
-
-            (
-
-                now
-
-                + timedelta(days=1)
-
-            ).date()
-
-        )
-
-        if callback.data == "status":
-
-            text = format_current(
-
-                today_data,
-
-                queue
-
-            )
-
-        elif callback.data == "today":
-
-            text = format_day(
-
-                today_data,
-
-                queue,
-
-                "📅 Графік на сьогодні"
-
-            )
-
-        else:
-
-            text = format_day(
-
-                tomorrow_data,
-
-                queue,
-
-                "📆 Графік на завтра"
-
-            )
 
         await safe_edit(
 
@@ -1978,7 +2372,11 @@ async def schedule(
 
             text,
 
-            main_keyboard()
+            main_keyboard(
+
+                bool(user["notifications"])
+
+            )
 
         )
 
@@ -1986,7 +2384,7 @@ async def schedule(
 
         print(
 
-            "Schedule error:",
+            "SCHEDULE CALLBACK ERROR:",
 
             repr(error),
 
@@ -2014,13 +2412,17 @@ async def schedule(
 
             ),
 
-            main_keyboard()
+            main_keyboard(
+
+                bool(user["notifications"])
+
+            )
 
         )
 
 # =========================================================
 
-# RENDER HEALTH CHECK
+# HEALTH CHECK ДЛЯ RENDER
 
 # =========================================================
 
@@ -2040,7 +2442,33 @@ async def health(request):
 
 async def main():
 
-    # Сервер для Render
+    global http_session
+
+    print(
+
+        "Starting Strum OK...",
+
+        flush=True
+
+    )
+
+    # PostgreSQL / Supabase
+
+    await init_database()
+
+    # HTTP-сесія для API
+
+    http_session = ClientSession(
+
+        timeout=ClientTimeout(
+
+            total=15
+
+        )
+
+    )
+
+    # Health server для Render
 
     app = web.Application()
 
@@ -2092,7 +2520,7 @@ async def main():
 
     )
 
-    # Telegram
+    # Telegram bot
 
     bot = Bot(
 
@@ -2113,8 +2541,6 @@ async def main():
         router
 
     )
-
-    # Запускаємо фоновий моніторинг
 
     monitor_task = asyncio.create_task(
 
@@ -2150,7 +2576,17 @@ async def main():
 
             pass
 
+        if http_session:
+
+            await http_session.close()
+
+        if db_pool:
+
+            await db_pool.close()
+
         await bot.session.close()
+
+        await runner.cleanup()
 
 if __name__ == "__main__":
 
