@@ -224,7 +224,9 @@ async def fetch_schedule(queue):
 
                 )
 
-            return await response.json()
+            data = await response.json()
+print("SCHEDULE DATA:", data, flush=True)
+return data
 
 def find_day(data, date):
 
