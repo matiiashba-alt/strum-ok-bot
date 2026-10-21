@@ -3,7 +3,7 @@ import os
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -128,11 +128,22 @@ async def schedule_placeholder(callback: CallbackQuery):
     )
     await callback.answer()
 
+async def health(request):
+    return web.Response(text="Strum OK bot is running")
+
 async def main():
+    app = web.Application()
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
-
 if __name__ == "__main__":
     asyncio.run(main())
