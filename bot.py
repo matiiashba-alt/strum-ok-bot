@@ -36,11 +36,11 @@ if not TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
+ADMIN_ID = 1962638884
+
 TZ = ZoneInfo("Europe/Kyiv")
 
 SCHEDULE_URL = "https://be-svitlo.oe.if.ua/schedule-by-queue"
-
-ADMIN_ID = 1962638884
 
 QUEUES = [
     f"{number}.{sub}"
@@ -55,6 +55,9 @@ router = Router()
 
 db_pool = None
 http_session = None
+
+# Чернетки адмінської розсилки
+broadcast_drafts = {}
 
 
 # =========================================================
@@ -83,7 +86,8 @@ async def init_database():
             )
         """)
 
-        # Додаємо нові поля без видалення старих користувачів
+        # Нові поля для адмін-статистики.
+        # Старі користувачі НЕ видаляються.
         await conn.execute("""
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS username TEXT
@@ -128,10 +132,6 @@ async def init_database():
 
 
 async def track_user(tg_user):
-    """
-    Зберігає/оновлює інформацію про користувача
-    та рахує його дії у боті.
-    """
 
     if tg_user is None:
         return
@@ -158,7 +158,6 @@ async def track_user(tg_user):
                 NOW(),
                 1
             )
-
             ON CONFLICT (telegram_id)
             DO UPDATE SET
                 username=EXCLUDED.username,
@@ -178,7 +177,7 @@ async def track_user(tg_user):
 async def get_user(user_id):
 
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
+        return await conn.fetchrow(
             """
             SELECT
                 queue,
@@ -195,8 +194,6 @@ async def get_user(user_id):
             user_id,
         )
 
-    return row
-
 
 async def save_user_queue(user_id, queue):
 
@@ -211,14 +208,7 @@ async def save_user_queue(user_id, queue):
                 updated_at,
                 last_active_at
             )
-            VALUES (
-                $1,
-                $2,
-                TRUE,
-                NOW(),
-                NOW(),
-                NOW()
-            )
+            VALUES ($1, $2, TRUE, NOW(), NOW(), NOW())
 
             ON CONFLICT (telegram_id)
             DO UPDATE SET
@@ -250,7 +240,7 @@ async def set_notifications(user_id, value):
 async def get_notification_users():
 
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
+        return await conn.fetch(
             """
             SELECT telegram_id, queue
             FROM users
@@ -259,7 +249,19 @@ async def get_notification_users():
             """
         )
 
-    return rows
+
+async def get_all_user_ids():
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT telegram_id
+            FROM users
+            ORDER BY created_at ASC
+            """
+        )
+
+    return [row["telegram_id"] for row in rows]
 
 
 async def notification_was_sent(key):
@@ -331,24 +333,37 @@ async def save_schedule_hash(queue, schedule_hash):
 
 
 # =========================================================
-# АДМІН — БАЗА / СТАТИСТИКА
+# АДМІН — СТАТИСТИКА
 # =========================================================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
 
 async def get_admin_stats():
 
-    async with db_pool.acquire() as conn:
+    now = datetime.now(TZ)
+    today_start = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
 
-        row = await conn.fetchrow(
+    week_start = today_start - timedelta(days=6)
+
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
             """
             SELECT
                 COUNT(*) AS total_users,
 
                 COUNT(*) FILTER (
-                    WHERE created_at >= CURRENT_DATE
+                    WHERE created_at >= $1
                 ) AS today_users,
 
                 COUNT(*) FILTER (
-                    WHERE created_at >= NOW() - INTERVAL '7 days'
+                    WHERE created_at >= $2
                 ) AS week_users,
 
                 COUNT(*) FILTER (
@@ -365,17 +380,16 @@ async def get_admin_stats():
                 ) AS total_actions
 
             FROM users
-            """
+            """,
+            today_start,
+            week_start,
         )
-
-    return row
 
 
 async def get_queue_stats():
 
     async with db_pool.acquire() as conn:
-
-        rows = await conn.fetch(
+        return await conn.fetch(
             """
             SELECT
                 queue,
@@ -387,14 +401,11 @@ async def get_queue_stats():
             """
         )
 
-    return rows
-
 
 async def get_recent_users(limit=10):
 
     async with db_pool.acquire() as conn:
-
-        rows = await conn.fetch(
+        return await conn.fetch(
             """
             SELECT
                 telegram_id,
@@ -413,14 +424,11 @@ async def get_recent_users(limit=10):
             limit,
         )
 
-    return rows
-
 
 async def get_active_users(limit=10):
 
     async with db_pool.acquire() as conn:
-
-        rows = await conn.fetch(
+        return await conn.fetch(
             """
             SELECT
                 telegram_id,
@@ -441,12 +449,6 @@ async def get_active_users(limit=10):
             limit,
         )
 
-    return rows
-
-
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
 
 def format_admin_datetime(value):
 
@@ -454,12 +456,9 @@ def format_admin_datetime(value):
         return "—"
 
     try:
-        local_value = value.astimezone(TZ)
-
-        return local_value.strftime(
+        return value.astimezone(TZ).strftime(
             "%d.%m.%Y %H:%M"
         )
-
     except Exception:
         return str(value)
 
@@ -469,9 +468,7 @@ def user_display_name(row):
     first_name = row["first_name"] or ""
     last_name = row["last_name"] or ""
 
-    full_name = (
-        f"{first_name} {last_name}"
-    ).strip()
+    full_name = f"{first_name} {last_name}".strip()
 
     if full_name:
         return html.escape(full_name)
@@ -480,40 +477,6 @@ def user_display_name(row):
         return "@" + html.escape(row["username"])
 
     return f"ID {row['telegram_id']}"
-
-
-def admin_keyboard():
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="admin:stats"
-                ),
-                InlineKeyboardButton(
-                    text="⚡ Підчерги",
-                    callback_data="admin:queues"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👥 Користувачі",
-                    callback_data="admin:users"
-                ),
-                InlineKeyboardButton(
-                    text="🆕 Останні",
-                    callback_data="admin:recent"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Оновити",
-                    callback_data="admin:refresh"
-                )
-            ],
-        ]
-    )
 
 
 async def build_admin_main():
@@ -562,9 +525,7 @@ async def build_queue_stats():
     total_with_queue = 0
 
     for queue in QUEUES:
-
         count = counts.get(queue, 0)
-
         total_with_queue += count
 
         lines.append(
@@ -588,17 +549,12 @@ def format_users_list(rows, title):
     ]
 
     if not rows:
-
-        lines.append(
+        return (
+            f"<b>{title}</b>\n\n"
             "Користувачів поки немає."
         )
 
-        return "\n".join(lines)
-
-    for index, row in enumerate(
-        rows,
-        start=1
-    ):
+    for index, row in enumerate(rows, start=1):
 
         name = user_display_name(row)
 
@@ -608,11 +564,7 @@ def format_users_list(rows, title):
             else "без username"
         )
 
-        queue = (
-            row["queue"]
-            if row["queue"]
-            else "—"
-        )
+        queue = row["queue"] or "—"
 
         notifications = (
             "🔔"
@@ -628,7 +580,7 @@ def format_users_list(rows, title):
             f"   ID: <code>{row['telegram_id']}</code>",
             f"   ⚡ {queue} · {notifications}",
             f"   📊 Дій: {actions}",
-            f"   🕐 Остання активність: "
+            f"   🕐 Активність: "
             f"{format_admin_datetime(row['last_active_at'])}",
             ""
         ])
@@ -644,17 +596,12 @@ def format_recent_users(rows):
     ]
 
     if not rows:
-
-        lines.append(
+        return (
+            "🆕 <b>Останні користувачі</b>\n\n"
             "Користувачів поки немає."
         )
 
-        return "\n".join(lines)
-
-    for index, row in enumerate(
-        rows,
-        start=1
-    ):
+    for index, row in enumerate(rows, start=1):
 
         name = user_display_name(row)
 
@@ -664,11 +611,7 @@ def format_recent_users(rows):
             else "без username"
         )
 
-        queue = (
-            row["queue"]
-            if row["queue"]
-            else "—"
-        )
+        queue = row["queue"] or "—"
 
         lines.extend([
             f"<b>{index}. {name}</b>",
@@ -767,6 +710,80 @@ def main_keyboard(notifications_enabled=True):
     )
 
 
+def admin_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="admin:stats"
+                ),
+                InlineKeyboardButton(
+                    text="⚡ Підчерги",
+                    callback_data="admin:queues"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 Користувачі",
+                    callback_data="admin:users"
+                ),
+                InlineKeyboardButton(
+                    text="🆕 Останні",
+                    callback_data="admin:recent"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Розсилка",
+                    callback_data="admin:broadcast"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Оновити",
+                    callback_data="admin:refresh"
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_cancel_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Скасувати",
+                    callback_data="broadcast:cancel"
+                )
+            ]
+        ]
+    )
+
+
+def broadcast_confirm_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Надіслати всім",
+                    callback_data="broadcast:confirm"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Скасувати",
+                    callback_data="broadcast:cancel"
+                )
+            ]
+        ]
+    )
+
+
 # =========================================================
 # TELEGRAM HELPERS
 # =========================================================
@@ -774,7 +791,6 @@ def main_keyboard(notifications_enabled=True):
 async def safe_edit(message, text, reply_markup=None):
 
     try:
-
         await message.edit_text(
             text,
             reply_markup=reply_markup
@@ -822,7 +838,6 @@ async def fetch_schedule(queue):
         )
 
         if response.status != 200:
-
             raise RuntimeError(
                 f"Schedule server returned HTTP {response.status}"
             )
@@ -859,25 +874,19 @@ def normalize_date(value):
     ]
 
     for fmt in formats:
-
         try:
-
             return datetime.strptime(
                 value,
                 fmt
             ).date()
-
         except ValueError:
             continue
 
     try:
-
         return datetime.fromisoformat(
             value.replace("Z", "+00:00")
         ).date()
-
     except Exception:
-
         return None
 
 
@@ -911,18 +920,12 @@ def get_periods(day_data, queue):
     if not isinstance(day_data, dict):
         return []
 
-    queues = day_data.get(
-        "queues",
-        {}
-    )
+    queues = day_data.get("queues", {})
 
     if not isinstance(queues, dict):
         return []
 
-    periods = queues.get(
-        queue,
-        []
-    )
+    periods = queues.get(queue, [])
 
     if not isinstance(periods, list):
         return []
@@ -933,16 +936,13 @@ def get_periods(day_data, queue):
 def time_to_minutes(value):
 
     try:
-
         parts = str(value).split(":")
-
         hour = int(parts[0])
         minute = int(parts[1])
 
         return hour * 60 + minute
 
     except Exception:
-
         return 0
 
 
@@ -956,10 +956,7 @@ def period_contains_now(period, now):
         period.get("to", "00:00")
     )
 
-    current = (
-        now.hour * 60
-        + now.minute
-    )
+    current = now.hour * 60 + now.minute
 
     if end == 0 and start > 0:
         end = 24 * 60
@@ -969,14 +966,8 @@ def period_contains_now(period, now):
 
 def minutes_until(time_value, now):
 
-    target = time_to_minutes(
-        time_value
-    )
-
-    current = (
-        now.hour * 60
-        + now.minute
-    )
+    target = time_to_minutes(time_value)
+    current = now.hour * 60 + now.minute
 
     return target - current
 
@@ -997,18 +988,12 @@ def duration_minutes(period):
     if end < start:
         end += 24 * 60
 
-    return max(
-        0,
-        end - start
-    )
+    return max(0, end - start)
 
 
 def human_duration(minutes):
 
-    minutes = max(
-        0,
-        int(minutes)
-    )
+    minutes = max(0, int(minutes))
 
     hours = minutes // 60
     mins = minutes % 60
@@ -1030,7 +1015,6 @@ def parse_status(value):
 
     try:
         return int(value)
-
     except Exception:
         return 0
 
@@ -1050,35 +1034,22 @@ def status_text(status):
 
 def format_period(period):
 
-    start = period.get(
-        "from",
-        "--:--"
-    )
-
-    end = period.get(
-        "to",
-        "--:--"
-    )
+    start = period.get("from", "--:--")
+    end = period.get("to", "--:--")
 
     status = parse_status(
-        period.get(
-            "status",
-            0
-        )
+        period.get("status", 0)
     )
 
     if status == 1:
-
         icon = "🔴"
         label = "вимкнення"
 
     elif status != 0:
-
         icon = "🟡"
         label = "можливе вимкнення"
 
     else:
-
         icon = "🟢"
         label = "світло має бути"
 
@@ -1090,7 +1061,7 @@ def format_period(period):
 
 
 # =========================================================
-# КОЛИ АКТИВНОГО ГРАФІКА НЕМАЄ
+# НЕМАЄ АКТИВНОГО ГРАФІКА
 # =========================================================
 
 def no_active_schedule_text(queue, mode):
@@ -1137,15 +1108,9 @@ def no_active_schedule_text(queue, mode):
 # ФОРМАТУВАННЯ ГРАФІКА
 # =========================================================
 
-def format_day(
-    day_data,
-    queue,
-    title,
-    mode
-):
+def format_day(day_data, queue, title, mode):
 
     if not day_data:
-
         return no_active_schedule_text(
             queue,
             mode
@@ -1172,7 +1137,6 @@ def format_day(
     else:
 
         for period in periods:
-
             lines.append(
                 format_period(period)
             )
@@ -1182,7 +1146,6 @@ def format_day(
     )
 
     if approved:
-
         lines.extend([
             "",
             f"🕐 Оновлено: {approved}"
@@ -1199,7 +1162,6 @@ def format_day(
 def format_current(day_data, queue):
 
     if not day_data:
-
         return no_active_schedule_text(
             queue,
             "status"
@@ -1220,7 +1182,6 @@ def format_current(day_data, queue):
             period,
             now
         ):
-
             current_period = period
             break
 
@@ -1261,7 +1222,6 @@ def format_current(day_data, queue):
     )
 
     if approved:
-
         text += (
             f"\n\n🕐 Графік оновлено: "
             f"{approved}"
@@ -1337,10 +1297,7 @@ def format_my_day(day_data, queue):
         )
 
         status = parse_status(
-            period.get(
-                "status",
-                0
-            )
+            period.get("status", 0)
         )
 
         duration = duration_minutes(
@@ -1348,17 +1305,14 @@ def format_my_day(day_data, queue):
         )
 
         if status == 1:
-
             outage_minutes += duration
 
         elif status != 0:
-
             possible_minutes += duration
 
         else:
 
             if duration > longest_light_minutes:
-
                 longest_light_minutes = duration
                 longest_light_period = period
 
@@ -1379,7 +1333,6 @@ def format_my_day(day_data, queue):
                         next_outage_remaining is None
                         or remaining < next_outage_remaining
                     ):
-
                         next_outage_remaining = remaining
                         next_outage = period
 
@@ -1452,16 +1405,9 @@ def format_my_day(day_data, queue):
         )
 
         if next_status == 1:
-
-            heading = (
-                "⚠️ Наступне відключення"
-            )
-
+            heading = "⚠️ Наступне відключення"
         else:
-
-            heading = (
-                "⚠️ Наступне можливе відключення"
-            )
+            heading = "⚠️ Наступне можливе відключення"
 
         lines.extend([
             f"<b>{heading}</b>",
@@ -1493,10 +1439,7 @@ def format_my_day(day_data, queue):
         for period in periods:
 
             status = parse_status(
-                period.get(
-                    "status",
-                    0
-                )
+                period.get("status", 0)
             )
 
             if (
@@ -1506,7 +1449,6 @@ def format_my_day(day_data, queue):
                     now
                 )
             ):
-
                 current_outage = period
                 break
 
@@ -1535,7 +1477,6 @@ def format_my_day(day_data, queue):
     )
 
     if approved:
-
         lines.extend([
             "",
             f"🕐 Графік оновлено: {approved}"
@@ -1557,19 +1498,13 @@ def format_my_day(day_data, queue):
 # ОТРИМАННЯ ТЕКСТУ ГРАФІКА
 # =========================================================
 
-async def build_schedule_text(
-    queue,
-    mode
-):
+async def build_schedule_text(queue, mode):
 
-    data = await fetch_schedule(
-        queue
-    )
+    data = await fetch_schedule(queue)
 
     if not data:
 
         if mode == "my_day":
-
             return format_my_day(
                 None,
                 queue
@@ -1623,8 +1558,7 @@ async def build_schedule_text(
     day_data = find_day(
         data,
         (
-            now
-            + timedelta(days=1)
+            now + timedelta(days=1)
         ).date()
     )
 
@@ -1664,9 +1598,7 @@ async def notify_schedule_change(
     data
 ):
 
-    new_hash = make_schedule_hash(
-        data
-    )
+    new_hash = make_schedule_hash(data)
 
     old_hash = await get_cached_schedule_hash(
         queue
@@ -1714,8 +1646,7 @@ async def notify_schedule_change(
     tomorrow_data = find_day(
         data,
         (
-            now
-            + timedelta(days=1)
+            now + timedelta(days=1)
         ).date()
     )
 
@@ -1821,10 +1752,7 @@ async def check_upcoming_outages(
     for period in periods:
 
         status = parse_status(
-            period.get(
-                "status",
-                0
-            )
+            period.get("status", 0)
         )
 
         if status == 0:
@@ -1973,7 +1901,6 @@ async def schedule_monitor(bot):
                 await asyncio.sleep(1)
 
         except asyncio.CancelledError:
-
             raise
 
         except Exception as error:
@@ -2031,9 +1958,7 @@ async def show_main_menu(
 # =========================================================
 
 @router.message(CommandStart())
-async def start_command(
-    message: Message
-):
+async def start_command(message: Message):
 
     await track_user(
         message.from_user
@@ -2050,14 +1975,18 @@ async def start_command(
 # =========================================================
 
 @router.message(Command("admin"))
-async def admin_command(
-    message: Message
-):
+async def admin_command(message: Message):
 
     if not is_admin(
         message.from_user.id
     ):
         return
+
+    # Якщо була незавершена чернетка — скидаємо.
+    broadcast_drafts.pop(
+        message.from_user.id,
+        None
+    )
 
     await track_user(
         message.from_user
@@ -2068,6 +1997,261 @@ async def admin_command(
     await message.answer(
         text,
         reply_markup=admin_keyboard()
+    )
+
+
+# =========================================================
+# АДМІН CALLBACK
+# =========================================================
+
+@router.callback_query(
+    F.data.startswith("admin:")
+)
+async def admin_callback(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Немає доступу.",
+            show_alert=True
+        )
+
+        return
+
+    await track_user(
+        callback.from_user
+    )
+
+    action = callback.data.split(
+        ":",
+        1
+    )[1]
+
+    # -------------------------
+    # РОЗСИЛКА
+    # -------------------------
+
+    if action == "broadcast":
+
+        broadcast_drafts[
+            callback.from_user.id
+        ] = {
+            "waiting": True
+        }
+
+        await callback.answer()
+
+        await safe_edit(
+            callback.message,
+            (
+                "📢 <b>Нова розсилка</b>\n\n"
+                "Надішліть наступним повідомленням "
+                "те, що потрібно розіслати "
+                "користувачам бота.\n\n"
+                "Можна надіслати текст, фото, "
+                "відео, GIF або інше звичайне "
+                "Telegram-повідомлення.\n\n"
+                "👁 Перед розсилкою бот покаже "
+                "вам попередній перегляд.\n\n"
+                "⚠️ Без натискання "
+                "«Надіслати всім» нічого "
+                "не буде розіслано."
+            ),
+            broadcast_cancel_keyboard()
+        )
+
+        return
+
+    await callback.answer()
+
+    if action in (
+        "stats",
+        "refresh"
+    ):
+
+        text = await build_admin_main()
+
+    elif action == "queues":
+
+        text = await build_queue_stats()
+
+    elif action == "users":
+
+        rows = await get_active_users(10)
+
+        text = format_users_list(
+            rows,
+            "👥 Останні активні користувачі"
+        )
+
+    elif action == "recent":
+
+        rows = await get_recent_users(10)
+
+        text = format_recent_users(
+            rows
+        )
+
+    else:
+
+        text = await build_admin_main()
+
+    await safe_edit(
+        callback.message,
+        text,
+        admin_keyboard()
+    )
+
+
+# =========================================================
+# РОЗСИЛКА — СКАСУВАТИ
+# =========================================================
+
+@router.callback_query(
+    F.data == "broadcast:cancel"
+)
+async def broadcast_cancel_callback(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Немає доступу.",
+            show_alert=True
+        )
+
+        return
+
+    broadcast_drafts.pop(
+        callback.from_user.id,
+        None
+    )
+
+    await callback.answer(
+        "Розсилку скасовано"
+    )
+
+    text = await build_admin_main()
+
+    await safe_edit(
+        callback.message,
+        text,
+        admin_keyboard()
+    )
+
+
+# =========================================================
+# РОЗСИЛКА — ПІДТВЕРДИТИ
+# =========================================================
+
+@router.callback_query(
+    F.data == "broadcast:confirm"
+)
+async def broadcast_confirm_callback(
+    callback: CallbackQuery
+):
+
+    if not is_admin(
+        callback.from_user.id
+    ):
+
+        await callback.answer(
+            "Немає доступу.",
+            show_alert=True
+        )
+
+        return
+
+    draft = broadcast_drafts.get(
+        callback.from_user.id
+    )
+
+    if (
+        not draft
+        or draft.get("waiting")
+        or not draft.get("message_id")
+    ):
+
+        await callback.answer(
+            "Чернетку розсилки не знайдено.",
+            show_alert=True
+        )
+
+        return
+
+    # Видаляємо чернетку ДО розсилки,
+    # щоб повторне натискання не запустило
+    # другу таку саму розсилку.
+    draft = broadcast_drafts.pop(
+        callback.from_user.id
+    )
+
+    await callback.answer(
+        "Розсилку запущено 📢"
+    )
+
+    await safe_edit(
+        callback.message,
+        (
+            "📢 <b>Розсилка виконується...</b>\n\n"
+            "Зачекайте. Після завершення "
+            "тут з'явиться звіт."
+        )
+    )
+
+    users = await get_all_user_ids()
+
+    total = len(users)
+    delivered = 0
+    failed = 0
+
+    for user_id in users:
+
+        try:
+
+            await callback.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=draft["chat_id"],
+                message_id=draft["message_id"]
+            )
+
+            delivered += 1
+
+        except Exception as error:
+
+            failed += 1
+
+            print(
+                "BROADCAST ERROR:",
+                user_id,
+                repr(error),
+                flush=True
+            )
+
+        # Щадний темп розсилки
+        await asyncio.sleep(0.05)
+
+    result_text = (
+        "✅ <b>Розсилку завершено</b>\n\n"
+        f"👥 Користувачів у базі: "
+        f"<b>{total}</b>\n\n"
+        f"✅ Надіслано: "
+        f"<b>{delivered}</b>\n"
+        f"❌ Не доставлено: "
+        f"<b>{failed}</b>"
+    )
+
+    await safe_edit(
+        callback.message,
+        result_text,
+        admin_keyboard()
     )
 
 
@@ -2131,9 +2315,7 @@ async def command_schedule(
 
 
 @router.message(Command("status"))
-async def status_command(
-    message: Message
-):
+async def status_command(message: Message):
 
     await command_schedule(
         message,
@@ -2142,9 +2324,7 @@ async def status_command(
 
 
 @router.message(Command("today"))
-async def today_command(
-    message: Message
-):
+async def today_command(message: Message):
 
     await command_schedule(
         message,
@@ -2153,9 +2333,7 @@ async def today_command(
 
 
 @router.message(Command("tomorrow"))
-async def tomorrow_command(
-    message: Message
-):
+async def tomorrow_command(message: Message):
 
     await command_schedule(
         message,
@@ -2164,9 +2342,7 @@ async def tomorrow_command(
 
 
 @router.message(Command("myday"))
-async def my_day_command(
-    message: Message
-):
+async def my_day_command(message: Message):
 
     await command_schedule(
         message,
@@ -2179,9 +2355,7 @@ async def my_day_command(
 # =========================================================
 
 @router.message(Command("queue"))
-async def queue_command(
-    message: Message
-):
+async def queue_command(message: Message):
 
     await track_user(
         message.from_user
@@ -2393,9 +2567,7 @@ async def notifications_callback(
 
         alert = "Сповіщення вимкнено 🔕"
 
-    await callback.answer(
-        alert
-    )
+    await callback.answer(alert)
 
     await safe_edit(
         callback.message,
@@ -2504,7 +2676,6 @@ async def send_rusnya_callback(
     notifications_enabled = True
 
     if user is not None:
-
         notifications_enabled = bool(
             user["notifications"]
         )
@@ -2519,194 +2690,51 @@ async def send_rusnya_callback(
 
 
 # =========================================================
-# CALLBACK: АДМІН-ПАНЕЛЬ
+# ЛОВИМО ПОВІДОМЛЕННЯ ДЛЯ АДМІНСЬКОЇ РОЗСИЛКИ
+#
+# ВАЖЛИВО:
+# цей handler стоїть ПІСЛЯ всіх команд.
+# Тому /start, /admin, /status тощо працюють як раніше.
 # =========================================================
 
-@router.callback_query(
-    F.data.startswith("admin:")
-)
-async def admin_callback(
-    callback: CallbackQuery
+@router.message()
+async def broadcast_draft_message(
+    message: Message
 ):
 
     if not is_admin(
-        callback.from_user.id
+        message.from_user.id
     ):
+        return
 
-        await callback.answer(
-            "Немає доступу.",
-            show_alert=True
+    draft = broadcast_drafts.get(
+        message.from_user.id
+    )
+
+    if not draft:
+        return
+
+    if not draft.get("waiting"):
+        return
+
+    # Не дозволяємо випадково взяти команду
+    # як текст розсилки.
+    if message.text and message.text.startswith("/"):
+
+        await message.answer(
+            "⚠️ Зараз бот очікує повідомлення "
+            "для розсилки.\n\n"
+            "Надішліть звичайний текст/фото/відео "
+            "або натисніть «Скасувати».",
+            reply_markup=broadcast_cancel_keyboard()
         )
 
         return
 
-    await track_user(
-        callback.from_user
-    )
-
-    action = callback.data.split(
-        ":",
-        1
-    )[1]
-
-    await callback.answer()
-
-    if action in (
-        "stats",
-        "refresh"
-    ):
-
-        text = await build_admin_main()
-
-    elif action == "queues":
-
-        text = await build_queue_stats()
-
-    elif action == "users":
-
-        rows = await get_active_users(
-            10
-        )
-
-        text = format_users_list(
-            rows,
-            "👥 Останні активні користувачі"
-        )
-
-    elif action == "recent":
-
-        rows = await get_recent_users(
-            10
-        )
-
-        text = format_recent_users(
-            rows
-        )
-
-    else:
-
-        text = await build_admin_main()
-
-    await safe_edit(
-        callback.message,
-        text,
-        admin_keyboard()
-    )
-
-
-# =========================================================
-# HEALTH CHECK ДЛЯ RENDER
-# =========================================================
-
-async def health(request):
-
-    return web.Response(
-        text="Strum OK is running"
-    )
-
-
-# =========================================================
-# ЗАПУСК
-# =========================================================
-
-async def main():
-
-    global http_session
-
-    print(
-        "Starting Strum OK...",
-        flush=True
-    )
-
-    await init_database()
-
-    http_session = ClientSession(
-        timeout=ClientTimeout(
-            total=15
-        )
-    )
-
-    app = web.Application()
-
-    app.router.add_get(
-        "/",
-        health
-    )
-
-    runner = web.AppRunner(
-        app
-    )
-
-    await runner.setup()
-
-    port = int(
-        os.getenv(
-            "PORT",
-            10000
-        )
-    )
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        port
-    )
-
-    await site.start()
-
-    print(
-        f"Health server started on port {port}",
-        flush=True
-    )
-
-    bot = Bot(
-        TOKEN,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML
-        )
-    )
-
-    dp = Dispatcher()
-
-    dp.include_router(
-        router
-    )
-
-    monitor_task = asyncio.create_task(
-        schedule_monitor(bot)
-    )
-
-    print(
-        "Strum OK bot started",
-        flush=True
-    )
-
-    try:
-
-        await dp.start_polling(
-            bot
-        )
-
-    finally:
-
-        monitor_task.cancel()
-
-        try:
-
-            await monitor_task
-
-        except asyncio.CancelledError:
-            pass
-
-        if http_session:
-            await http_session.close()
-
-        if db_pool:
-            await db_pool.close()
-
-        await bot.session.close()
-        await runner.cleanup()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    broadcast_drafts[
+        message.from_user.id
+    ] = {
+        "waiting": False,
+        "chat_id": message.chat.id,
+        "message_id": message.message_id,
+   
