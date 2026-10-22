@@ -3,7 +3,7 @@ import os
 import json
 import hashlib
 import html
-
+from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -26,7 +26,7 @@ from aiogram.exceptions import TelegramBadRequest
 # =========================================================
 # НАЛАШТУВАННЯ
 # =========================================================
-
+load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
