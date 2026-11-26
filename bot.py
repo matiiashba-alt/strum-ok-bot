@@ -135,6 +135,13 @@ async def init_database():
             ADD COLUMN IF NOT EXISTS queue_schedule_hash TEXT
         """)
 
+        # Попередній знімок графіка потрібен для порівняння
+        # тривалості відключень до та після оновлення.
+        await conn.execute("""
+            ALTER TABLE schedule_cache
+            ADD COLUMN IF NOT EXISTS schedule_data TEXT
+        """)
+
     print("PostgreSQL database initialized", flush=True)
 
 
@@ -317,7 +324,34 @@ async def get_cached_schedule_hash(queue):
         )
 
 
-async def save_schedule_hash(queue, schedule_hash):
+async def get_cached_schedule_data(queue):
+
+    async with db_pool.acquire() as conn:
+        raw_data = await conn.fetchval(
+            """
+            SELECT schedule_data
+            FROM schedule_cache
+            WHERE queue=$1
+            """,
+            queue,
+        )
+
+    if not raw_data:
+        return None
+
+    try:
+        return json.loads(raw_data)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+async def save_schedule_hash(queue, schedule_hash, data=None):
+
+    serialized_data = (
+        json.dumps(data, ensure_ascii=False)
+        if data is not None
+        else None
+    )
 
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -325,17 +359,23 @@ async def save_schedule_hash(queue, schedule_hash):
             INSERT INTO schedule_cache (
                 queue,
                 queue_schedule_hash,
+                schedule_data,
                 updated_at
             )
-            VALUES ($1, $2, NOW())
+            VALUES ($1, $2, $3, NOW())
 
             ON CONFLICT (queue)
             DO UPDATE SET
                 queue_schedule_hash=EXCLUDED.queue_schedule_hash,
+                schedule_data=COALESCE(
+                    EXCLUDED.schedule_data,
+                    schedule_cache.schedule_data
+                ),
                 updated_at=NOW()
             """,
             queue,
             schedule_hash,
+            serialized_data,
         )
 
 
@@ -1014,6 +1054,76 @@ def human_duration(minutes):
     return f"{mins} хв"
 
 
+
+def outage_duration_totals(day_data, queue):
+    """Повертає хвилини підтверджених і можливих відключень за день."""
+
+    confirmed_minutes = 0
+    possible_minutes = 0
+
+    for period in get_periods(day_data, queue):
+        status = parse_status(period.get("status", 0))
+        duration = duration_minutes(period)
+
+        if status == 1:
+            confirmed_minutes += duration
+        elif status != 0:
+            possible_minutes += duration
+
+    return confirmed_minutes, possible_minutes
+
+
+def format_duration_change(label, old_minutes, new_minutes):
+
+    difference = new_minutes - old_minutes
+
+    if difference == 0:
+        return (
+            f"➖ {label}: без змін "
+            f"({human_duration(new_minutes)})"
+        )
+
+    if difference < 0:
+        return (
+            f"🟢 {label}: скоротилися на "
+            f"<b>{human_duration(abs(difference))}</b> "
+            f"(було {human_duration(old_minutes)}, "
+            f"стало {human_duration(new_minutes)})"
+        )
+
+    return (
+        f"🔴 {label}: збільшилися на "
+        f"<b>{human_duration(difference)}</b> "
+        f"(було {human_duration(old_minutes)}, "
+        f"стало {human_duration(new_minutes)})"
+    )
+
+
+def format_day_duration_summary(day_data, queue):
+
+    confirmed, possible = outage_duration_totals(
+        day_data,
+        queue
+    )
+
+    lines = ["", "📊 <b>Тривалість відключень за день</b>"]
+
+    if confirmed:
+        lines.append(
+            f"🔴 Без світла: <b>{human_duration(confirmed)}</b>"
+        )
+    else:
+        lines.append("🟢 Підтверджених відключень немає")
+
+    if possible:
+        lines.append(
+            f"🟡 Можливі відключення: "
+            f"<b>{human_duration(possible)}</b>"
+        )
+
+    return lines
+
+
 # =========================================================
 # СТАТУСИ ГРАФІКА
 # =========================================================
@@ -1060,10 +1170,16 @@ def format_period(period):
         icon = "🟢"
         label = "світло має бути"
 
+    duration_suffix = ""
+    if status != 0:
+        duration_suffix = (
+            f" ({human_duration(duration_minutes(period))})"
+        )
+
     return (
         f"{icon} "
         f"<b>{start}–{end}</b> — "
-        f"{label}"
+        f"{label}{duration_suffix}"
     )
 
 
@@ -1147,6 +1263,10 @@ def format_day(day_data, queue, title, mode):
             lines.append(
                 format_period(period)
             )
+
+        lines.extend(
+            format_day_duration_summary(day_data, queue)
+        )
 
     approved = day_data.get(
         "scheduleApprovedSince"
@@ -1656,22 +1776,37 @@ async def notify_schedule_change(
     old_hash = await get_cached_schedule_hash(
         queue
     )
+    old_data = await get_cached_schedule_data(
+        queue
+    )
 
     if old_hash is None:
 
         await save_schedule_hash(
             queue,
-            new_hash
+            new_hash,
+            data
         )
 
         return
 
     if old_hash == new_hash:
+        # Для старих записів кешу додаємо знімок графіка,
+        # не надсилаючи користувачам зайвих повідомлень.
+        if old_data is None:
+            await save_schedule_hash(
+                queue,
+                new_hash,
+                data
+            )
         return
 
+    # Зберігаємо новий графік після отримання старого знімка,
+    # щоб можна було порівняти тривалість відключень.
     await save_schedule_hash(
         queue,
-        new_hash
+        new_hash,
+        data
     )
 
     async with db_pool.acquire() as conn:
@@ -1702,6 +1837,8 @@ async def notify_schedule_change(
             now + timedelta(days=1)
         ).date()
     )
+
+    tomorrow_date = (now + timedelta(days=1)).date()
 
     if today_data:
 
@@ -1738,8 +1875,57 @@ async def notify_schedule_change(
             "Перевірте актуальні дані в боті."
         )
 
+    comparison_sections = []
+
+    if old_data:
+        days_to_compare = [
+            ("сьогодні", today_data, find_day(old_data, now.date())),
+            ("завтра", tomorrow_data, find_day(old_data, tomorrow_date)),
+        ]
+
+        for day_title, new_day, previous_day in days_to_compare:
+
+            if new_day is None or previous_day is None:
+                continue
+
+            old_confirmed, old_possible = outage_duration_totals(
+                previous_day,
+                queue
+            )
+            new_confirmed, new_possible = outage_duration_totals(
+                new_day,
+                queue
+            )
+
+            comparison_lines = [
+                f"📊 <b>Зміна тривалості відключень ({day_title}):</b>",
+                format_duration_change(
+                    "Без світла",
+                    old_confirmed,
+                    new_confirmed
+                ),
+            ]
+
+            if old_possible or new_possible:
+                comparison_lines.append(
+                    format_duration_change(
+                        "Можливі відключення",
+                        old_possible,
+                        new_possible
+                    )
+                )
+
+            comparison_sections.append("\n".join(comparison_lines))
+
+    comparison_text = (
+        "\n\n" + "\n\n".join(comparison_sections) + "\n\n"
+        if comparison_sections
+        else ""
+    )
+
     text = (
         "🔔 <b>Графік оновлено</b>\n\n"
+        + comparison_text
         + body
     )
 
@@ -1871,7 +2057,8 @@ async def check_upcoming_outages(
                 f"{heading}\n\n"
                 f"Підчерга: <b>{queue}</b>\n"
                 f"Початок: <b>{start}</b>\n"
-                f"До: <b>{end or '--:--'}</b>\n\n"
+                f"До: <b>{end or '--:--'}</b>\n"
+                f"Тривалість: <b>{human_duration(duration_minutes(period))}</b>\n\n"
                 f"До початку приблизно "
                 f"<b>{remaining} хв.</b>\n\n"
                 "🔋 Перевірте заряд телефону "
