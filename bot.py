@@ -50,7 +50,7 @@ QUEUES = [
 
 CHECK_INTERVAL = 300
 WARNING_MINUTES = 30
-BUILD_VERSION = "tomorrow-notify-2026-11-26"
+BUILD_VERSION = "duration-display-2026-11-26"
 
 router = Router()
 
@@ -738,6 +738,12 @@ def main_keyboard(notifications_enabled=True):
             ],
             [
                 InlineKeyboardButton(
+                    text="📋 Подивитись весь графік",
+                    callback_data="all_schedules"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="🔄 Змінити підчергу",
                     callback_data="change_queue"
                 ),
@@ -756,6 +762,240 @@ def main_keyboard(notifications_enabled=True):
             ],
         ]
     )
+
+
+def all_schedules_day_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 На сьогодні (всі черги)",
+                    callback_data="all_day:today"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📆 На завтра (всі черги)",
+                    callback_data="all_day:tomorrow"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 Обрати конкретну підчергу",
+                    callback_data="all_pick_queue"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад до меню",
+                    callback_data="back_main"
+                ),
+            ],
+        ]
+    )
+
+
+def all_pick_queue_keyboard():
+
+    rows = []
+
+    for i in range(0, len(QUEUES), 3):
+        row = []
+        for q in QUEUES[i:i + 3]:
+            row.append(
+                InlineKeyboardButton(
+                    text=q,
+                    callback_data=f"view_q:{q}:today"
+                )
+            )
+        rows.append(row)
+
+    rows.append([
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="all_schedules"
+        )
+    ])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def view_single_queue_keyboard(queue, day_mode):
+
+    switch_day = "tomorrow" if day_mode == "today" else "today"
+    switch_label = (
+        "📆 Завтра для " + queue
+        if day_mode == "today"
+        else "📅 Сьогодні для " + queue
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=switch_label,
+                    callback_data=f"view_q:{queue}:{switch_day}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 Інша підчерга",
+                    callback_data="all_pick_queue"
+                ),
+                InlineKeyboardButton(
+                    text="📋 Всі черги",
+                    callback_data=f"all_day:{day_mode}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Головне меню",
+                    callback_data="back_main"
+                ),
+            ],
+        ]
+    )
+
+
+def all_schedules_result_keyboard(day_mode):
+
+    switch_day = "tomorrow" if day_mode == "today" else "today"
+    switch_label = (
+        "📆 Весь графік на завтра"
+        if day_mode == "today"
+        else "📅 Весь графік на сьогодні"
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=switch_label,
+                    callback_data=f"all_day:{switch_day}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 Детально по одній підчерзі",
+                    callback_data="all_pick_queue"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Головне меню",
+                    callback_data="back_main"
+                ),
+            ],
+        ]
+    )
+
+
+def format_compact_periods(day_data, queue):
+
+    if not day_data:
+        return "немає даних"
+
+    periods = get_periods(day_data, queue)
+    if not periods:
+        return "без вимкнень 🟢"
+
+    outage_parts = []
+    for period in periods:
+        status = parse_status(period.get("status", 0))
+        if status == 0:
+            continue
+        start = period.get("from", "--:--")
+        end = period.get("to", "--:--")
+        icon = "🔴" if status == 1 else "🟡"
+        outage_parts.append(f"{icon} {start}–{end}")
+
+    if not outage_parts:
+        return "без вимкнень 🟢"
+
+    confirmed, possible = outage_duration_totals(day_data, queue)
+    total_mins = confirmed + possible
+    summary = ", ".join(outage_parts)
+    if total_mins > 0:
+        summary += f" <i>({human_duration(total_mins)})</i>"
+    return summary
+
+
+async def build_all_queues_text(day_mode):
+
+    now = datetime.now(TZ)
+    target_date = (
+        now.date()
+        if day_mode == "today"
+        else (now + timedelta(days=1)).date()
+    )
+    date_str = target_date.strftime("%d.%m.%Y")
+    title = (
+        f"📅 <b>Весь графік на сьогодні ({date_str})</b>"
+        if day_mode == "today"
+        else f"📆 <b>Весь графік на завтра ({date_str})</b>"
+    )
+
+    first_data = await fetch_schedule(QUEUES[0])
+    first_day = find_day(first_data, target_date)
+
+    has_all_in_one = False
+    if isinstance(first_day, dict) and isinstance(first_day.get("queues"), dict):
+        if all(q in first_day["queues"] for q in QUEUES):
+            has_all_in_one = True
+
+    day_by_queue = {}
+    if has_all_in_one:
+        for q in QUEUES:
+            day_by_queue[q] = first_day
+    else:
+        day_by_queue[QUEUES[0]] = first_day
+        for q in QUEUES[1:]:
+            try:
+                q_data = await fetch_schedule(q)
+                day_by_queue[q] = find_day(q_data, target_date)
+            except Exception as error:
+                print("ALL QUEUES FETCH ERROR:", q, repr(error), flush=True)
+                day_by_queue[q] = None
+            await asyncio.sleep(0.1)
+
+    any_day_exists = any(d is not None for d in day_by_queue.values())
+    if not any_day_exists:
+        when_word = "сьогодні" if day_mode == "today" else "завтра"
+        return (
+            f"{title}\n\n"
+            f"ℹ️ <b>Активний графік ГПВ на {when_word} "
+            "поки не опублікований.</b>\n\n"
+            "Джерело: Прикарпаттяобленерго"
+        )
+
+    lines = [title, ""]
+
+    for q in QUEUES:
+        d_data = day_by_queue.get(q)
+        lines.append(f"<b>{q}</b>: {format_compact_periods(d_data, q)}")
+
+    approved = None
+    for d_data in day_by_queue.values():
+        if isinstance(d_data, dict) and d_data.get("scheduleApprovedSince"):
+            approved = d_data.get("scheduleApprovedSince")
+            break
+
+    if approved:
+        lines.extend([
+            "",
+            f"🕐 Оновлено: {approved}"
+        ])
+
+    lines.extend([
+        "",
+        "🔴 — вимкнення · 🟡 — можливе вимкнення",
+        "Джерело: Прикарпаттяобленерго"
+    ])
+
+    return "\n".join(lines)
 
 
 def admin_keyboard():
@@ -1053,6 +1293,7 @@ def human_duration(minutes):
         return f"{hours} год"
 
     return f"{mins} хв"
+
 
 
 def outage_duration_totals(day_data, queue):
@@ -1741,112 +1982,6 @@ def make_schedule_hash(data, queue):
     ).hexdigest()
 
 
-def make_day_schedule_hash(data, queue, target_date):
-    """Рахує хеш графіка конкретної підчерги лише на вказану дату."""
-    day_data = find_day(data, target_date)
-    if not isinstance(day_data, dict):
-        return None
-
-    queues = day_data.get("queues")
-    if not isinstance(queues, dict) or queue not in queues:
-        return None
-
-    periods = get_periods(day_data, queue)
-    payload = {
-        "eventDate": str(normalize_date(day_data.get("eventDate"))),
-        "queue": queue,
-        "periods": periods,
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-    return hashlib.sha256(encoded).hexdigest()
-
-
-# =========================================================
-# СПОВІЩЕННЯ ПРО ПОЯВУ / ОНОВЛЕННЯ ГРАФІКА НА ЗАВТРА
-# =========================================================
-
-async def notify_tomorrow_schedule(
-    bot,
-    queue,
-    data
-):
-    """Надсилає графік на завтра, щойно він з'являється або змінюється."""
-    if not isinstance(data, list) or not data:
-        return
-
-    now = datetime.now(TZ)
-    tomorrow_date = (now + timedelta(days=1)).date()
-    tomorrow_data = find_day(data, tomorrow_date)
-
-    if not tomorrow_data:
-        return
-
-    tomorrow_hash = make_day_schedule_hash(
-        data,
-        queue,
-        tomorrow_date
-    )
-    if not tomorrow_hash:
-        return
-
-    probe_key = f"tomorrow:{tomorrow_date}:{queue}:{tomorrow_hash}"
-    if await notification_was_sent(probe_key):
-        return
-
-    async with db_pool.acquire() as conn:
-        users = await conn.fetch(
-            """
-            SELECT telegram_id
-            FROM users
-            WHERE queue=$1
-              AND notifications=TRUE
-            """,
-            queue,
-        )
-
-    seen_date_key = f"tomorrow-seen:{tomorrow_date}:{queue}"
-    had_previous_for_date = await notification_was_sent(seen_date_key)
-
-    heading = (
-        "🔄 <b>Оновлено графік на завтра</b>"
-        if had_previous_for_date
-        else "⚡ <b>З'явився графік на завтра!</b>"
-    )
-
-    body = format_day(
-        tomorrow_data,
-        queue,
-        "📆 Графік на завтра",
-        "tomorrow",
-    )
-
-    text = f"{heading}\n\n{body}"
-
-    for user in users:
-        try:
-            await bot.send_message(
-                user["telegram_id"],
-                text
-            )
-            await asyncio.sleep(0.05)
-        except Exception as error:
-            print(
-                "TOMORROW NOTIFICATION ERROR:",
-                user["telegram_id"],
-                repr(error),
-                flush=True,
-            )
-
-    await mark_notification_sent(probe_key)
-    await mark_notification_sent(seen_date_key)
-
-
 # =========================================================
 # СПОВІЩЕННЯ ПРО ЗМІНУ ГРАФІКА
 # =========================================================
@@ -1916,39 +2051,6 @@ async def notify_schedule_change(
         data
     )
 
-    now = datetime.now(TZ)
-    today_date = now.date()
-    tomorrow_date = (now + timedelta(days=1)).date()
-
-    today_data = find_day(
-        data,
-        today_date
-    )
-
-    tomorrow_data = find_day(
-        data,
-        tomorrow_date
-    )
-
-    # Якщо змінився лише графік на завтра, окреме сповіщення
-    # надішле notify_tomorrow_schedule без дублювання.
-    old_today_hash = (
-        make_day_schedule_hash(old_data, queue, today_date)
-        if old_data
-        else None
-    )
-    new_today_hash = make_day_schedule_hash(
-        data,
-        queue,
-        today_date
-    )
-
-    if (
-        tomorrow_data is not None
-        and old_today_hash == new_today_hash
-    ):
-        return
-
     async with db_pool.acquire() as conn:
 
         users = await conn.fetch(
@@ -1963,6 +2065,22 @@ async def notify_schedule_change(
 
     if not users:
         return
+
+    now = datetime.now(TZ)
+
+    today_data = find_day(
+        data,
+        now.date()
+    )
+
+    tomorrow_data = find_day(
+        data,
+        (
+            now + timedelta(days=1)
+        ).date()
+    )
+
+    tomorrow_date = (now + timedelta(days=1)).date()
 
     if today_data:
 
@@ -2003,7 +2121,7 @@ async def notify_schedule_change(
 
     if old_data:
         days_to_compare = [
-            ("сьогодні", today_data, find_day(old_data, today_date)),
+            ("сьогодні", today_data, find_day(old_data, now.date())),
             ("завтра", tomorrow_data, find_day(old_data, tomorrow_date)),
         ]
 
@@ -2061,7 +2179,6 @@ async def notify_schedule_change(
                 user["telegram_id"],
                 text
             )
-            await asyncio.sleep(0.05)
 
         except Exception as error:
 
@@ -2243,12 +2360,6 @@ async def schedule_monitor(bot):
                     )
 
                     await notify_schedule_change(
-                        bot,
-                        queue,
-                        data
-                    )
-
-                    await notify_tomorrow_schedule(
                         bot,
                         queue,
                         data
@@ -3020,6 +3131,186 @@ async def schedule_callback(
             main_keyboard(
                 bool(user["notifications"])
             )
+        )
+
+
+# =========================================================
+# CALLBACK: ПОДИВИТИСЬ ВЕСЬ ГРАФІК / РАЗОВО ІНША ПІДЧЕРГА
+# =========================================================
+
+@router.callback_query(
+    F.data == "back_main"
+)
+async def back_main_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    await callback.answer()
+
+    user = await get_user(
+        callback.from_user.id
+    )
+
+    if not user or not user["queue"]:
+        await safe_edit(
+            callback.message,
+            "⚡ <b>Струм ОК</b>\n\n"
+            "Оберіть свою підчергу:",
+            queue_keyboard()
+        )
+        return
+
+    await safe_edit(
+        callback.message,
+        "⚡ <b>Струм ОК</b>\n\n"
+        f"Ваша підчерга: <b>{user['queue']}</b>\n\n"
+        "Оберіть потрібний розділ:",
+        main_keyboard(
+            bool(user["notifications"])
+        )
+    )
+
+
+@router.callback_query(
+    F.data == "all_schedules"
+)
+async def all_schedules_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    await callback.answer()
+
+    await safe_edit(
+        callback.message,
+        "📋 <b>Перегляд графіка по всіх чергах</b>\n\n"
+        "Тут можна разово подивитися графік для всіх "
+        "підчерг або обрати потрібну чергу (ваша "
+        "збережена підчерга для сповіщень не зміниться):",
+        all_schedules_day_keyboard()
+    )
+
+
+@router.callback_query(
+    F.data.startswith("all_day:")
+)
+async def all_day_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    day_mode = callback.data.split(":", 1)[1]
+    if day_mode not in ("today", "tomorrow"):
+        day_mode = "today"
+
+    await callback.answer("Завантажую графік...")
+
+    try:
+        text = await build_all_queues_text(day_mode)
+
+        await safe_edit(
+            callback.message,
+            text,
+            all_schedules_result_keyboard(day_mode)
+        )
+
+    except Exception as error:
+        print(
+            "ALL SCHEDULES ERROR:",
+            repr(error),
+            flush=True
+        )
+
+        await safe_edit(
+            callback.message,
+            "⚠️ <b>Не вдалося отримати загальний графік.</b>\n\n"
+            "Сервіс Прикарпаттяобленерго тимчасово не відповідає.\n\n"
+            "Спробуйте ще раз через кілька хвилин.",
+            all_schedules_day_keyboard()
+        )
+
+
+@router.callback_query(
+    F.data == "all_pick_queue"
+)
+async def all_pick_queue_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    await callback.answer()
+
+    await safe_edit(
+        callback.message,
+        "🔎 <b>Разовий перегляд підчерги</b>\n\n"
+        "Оберіть підчергу, яку хочете подивитися "
+        "(ваша основна підчерга залишиться без змін):",
+        all_pick_queue_keyboard()
+    )
+
+
+@router.callback_query(
+    F.data.startswith("view_q:")
+)
+async def view_single_queue_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Некоректний запит.", show_alert=True)
+        return
+
+    target_queue = parts[1]
+    day_mode = parts[2]
+
+    if target_queue not in QUEUES or day_mode not in ("today", "tomorrow"):
+        await callback.answer("Невідома підчерга.", show_alert=True)
+        return
+
+    await callback.answer()
+
+    try:
+        text = await build_schedule_text(
+            target_queue,
+            day_mode
+        )
+
+        await safe_edit(
+            callback.message,
+            text,
+            view_single_queue_keyboard(target_queue, day_mode)
+        )
+
+    except Exception as error:
+        print(
+            "VIEW SINGLE QUEUE ERROR:",
+            repr(error),
+            flush=True
+        )
+
+        await safe_edit(
+            callback.message,
+            "⚠️ <b>Не вдалося отримати графік.</b>\n\n"
+            "Сервіс Прикарпаттяобленерго тимчасово не відповідає.",
+            all_pick_queue_keyboard()
         )
 
 
