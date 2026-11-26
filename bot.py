@@ -50,6 +50,7 @@ QUEUES = [
 
 CHECK_INTERVAL = 300
 WARNING_MINUTES = 30
+BUILD_VERSION = "duration-display-2026-11-26"
 
 router = Router()
 
@@ -1129,10 +1130,11 @@ def format_day_duration_summary(day_data, queue):
 # =========================================================
 
 def parse_status(value):
-
+    """Нормалізує статус API до цілого числа."""
     try:
-        return int(value)
-    except Exception:
+        # API іноді може повертати числове значення як рядок/float.
+        return int(float(value))
+    except (TypeError, ValueError):
         return 0
 
 
@@ -1170,11 +1172,11 @@ def format_period(period):
         icon = "🟢"
         label = "світло має бути"
 
+    # Тривалість показуємо для кожного типу відключення:
+    # підтвердженого та можливого. Для періоду зі світлом її не додаємо.
     duration_suffix = ""
     if status != 0:
-        duration_suffix = (
-            f" ({human_duration(duration_minutes(period))})"
-        )
+        duration_suffix = f" ({human_duration(duration_minutes(period))})"
 
     return (
         f"{icon} "
@@ -3047,7 +3049,7 @@ async def main():
     global http_session
 
     print(
-        "Starting Strum OK...",
+        f"Starting Strum OK... BUILD_VERSION={BUILD_VERSION}",
         flush=True
     )
 
