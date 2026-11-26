@@ -128,6 +128,13 @@ async def init_database():
             )
         """)
 
+        # Окремий хеш саме графіка підчерги.
+        # Старий schedule_hash зберігаємо для сумісності.
+        await conn.execute("""
+            ALTER TABLE schedule_cache
+            ADD COLUMN IF NOT EXISTS queue_schedule_hash TEXT
+        """)
+
     print("PostgreSQL database initialized", flush=True)
 
 
@@ -302,7 +309,7 @@ async def get_cached_schedule_hash(queue):
     async with db_pool.acquire() as conn:
         return await conn.fetchval(
             """
-            SELECT schedule_hash
+            SELECT queue_schedule_hash
             FROM schedule_cache
             WHERE queue=$1
             """,
@@ -317,14 +324,14 @@ async def save_schedule_hash(queue, schedule_hash):
             """
             INSERT INTO schedule_cache (
                 queue,
-                schedule_hash,
+                queue_schedule_hash,
                 updated_at
             )
             VALUES ($1, $2, NOW())
 
             ON CONFLICT (queue)
             DO UPDATE SET
-                schedule_hash=EXCLUDED.schedule_hash,
+                queue_schedule_hash=EXCLUDED.queue_schedule_hash,
                 updated_at=NOW()
             """,
             queue,
@@ -1574,10 +1581,35 @@ async def build_schedule_text(queue, mode):
 # HASH ГРАФІКА
 # =========================================================
 
-def make_schedule_hash(data):
+def make_schedule_hash(data, queue):
+
+    # Хешуємо лише дані конкретної підчерги.
+    # Зміни в інших підчергах не повинні запускати розсилку.
+    queue_data = []
+
+    if not isinstance(data, list):
+        return None
+
+    for item in data:
+
+        if not isinstance(item, dict):
+            continue
+
+        queues = item.get("queues")
+
+        if not isinstance(queues, dict) or queue not in queues:
+            continue
+
+        queue_data.append({
+            "eventDate": item.get("eventDate"),
+            "queue": queues.get(queue),
+        })
+
+    if not queue_data:
+        return None
 
     encoded = json.dumps(
-        data,
+        queue_data,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":")
@@ -1598,7 +1630,28 @@ async def notify_schedule_change(
     data
 ):
 
-    new_hash = make_schedule_hash(data)
+    # Порожня або некоректна відповідь API не є підтвердженим
+    # оновленням графіка і не повинна запускати розсилку.
+    if not isinstance(data, list) or not data:
+        print(
+            "SCHEDULE CHANGE SKIPPED: empty or invalid data for",
+            queue,
+            flush=True
+        )
+        return
+
+    new_hash = make_schedule_hash(
+        data,
+        queue
+    )
+
+    if new_hash is None:
+        print(
+            "SCHEDULE CHANGE SKIPPED: queue data missing for",
+            queue,
+            flush=True
+        )
+        return
 
     old_hash = await get_cached_schedule_hash(
         queue
