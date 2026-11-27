@@ -756,8 +756,20 @@ def main_keyboard(notifications_enabled=True):
             ],
             [
                 InlineKeyboardButton(
+                    text="🤖 Наші боти",
+                    callback_data="our_bots"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🖕 Послати нах*й русню!",
                     callback_data="send_rusnya"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💡 Зауваження та пропозиції",
+                    callback_data="feedback"
                 )
             ],
         ]
@@ -893,16 +905,16 @@ def all_schedules_result_keyboard(day_mode):
     )
 
 
-def format_compact_periods(day_data, queue):
+def format_queue_block(day_data, queue):
 
     if not day_data:
-        return "немає даних"
+        return f"⚡ <b>Підчерга {queue}</b> — немає даних"
 
     periods = get_periods(day_data, queue)
     if not periods:
-        return "без вимкнень 🟢"
+        return f"⚡ <b>Підчерга {queue}</b> — 🟢 без вимкнень"
 
-    outage_parts = []
+    outage_lines = []
     for period in periods:
         status = parse_status(period.get("status", 0))
         if status == 0:
@@ -910,17 +922,16 @@ def format_compact_periods(day_data, queue):
         start = period.get("from", "--:--")
         end = period.get("to", "--:--")
         icon = "🔴" if status == 1 else "🟡"
-        outage_parts.append(f"{icon} {start}–{end}")
+        dur = human_duration(duration_minutes(period))
+        outage_lines.append(f"   {icon} <code>{start}–{end}</code> ({dur})")
 
-    if not outage_parts:
-        return "без вимкнень 🟢"
+    if not outage_lines:
+        return f"⚡ <b>Підчерга {queue}</b> — 🟢 без вимкнень"
 
     confirmed, possible = outage_duration_totals(day_data, queue)
     total_mins = confirmed + possible
-    summary = ", ".join(outage_parts)
-    if total_mins > 0:
-        summary += f" <i>({human_duration(total_mins)})</i>"
-    return summary
+    header = f"⚡ <b>Підчерга {queue}</b> · <i>всього {human_duration(total_mins)}</i>"
+    return "\n".join([header] + outage_lines)
 
 
 async def build_all_queues_text(day_mode):
@@ -973,9 +984,15 @@ async def build_all_queues_text(day_mode):
 
     lines = [title, ""]
 
-    for q in QUEUES:
+    for idx, q in enumerate(QUEUES):
+        if idx > 0 and q.endswith(".1"):
+            lines.append("────────────")
         d_data = day_by_queue.get(q)
-        lines.append(f"<b>{q}</b>: {format_compact_periods(d_data, q)}")
+        lines.append(format_queue_block(d_data, q))
+        lines.append("")
+
+    if lines[-1] == "":
+        lines.pop()
 
     approved = None
     for d_data in day_by_queue.values():
@@ -996,6 +1013,52 @@ async def build_all_queues_text(day_mode):
     ])
 
     return "\n".join(lines)
+
+
+def our_bots_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎵 Yevibe Bot (Пошук музики)",
+                    url="https://t.me/Yevibe_bot"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚌 Мені туди (Маршрутки та зупинки)",
+                    url="https://t.me/menitudy_bot"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🤫 Анонімні зізнання та історії",
+                    url="https://t.me/+8ROwDs5cqV05MTMy"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад до меню",
+                    callback_data="back_main"
+                ),
+            ],
+        ]
+    )
+
+
+def feedback_keyboard():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад до меню",
+                    callback_data="back_main"
+                ),
+            ],
+        ]
+    )
 
 
 def admin_keyboard():
@@ -2160,7 +2223,7 @@ async def notify_schedule_change(
             comparison_sections.append("\n".join(comparison_lines))
 
     comparison_text = (
-        "\n\n" + "\n\n".join(comparison_sections) + "\n\n"
+        "\n\n".join(comparison_sections) + "\n\n"
         if comparison_sections
         else ""
     )
@@ -3315,6 +3378,50 @@ async def view_single_queue_callback(
 
 
 # =========================================================
+# CALLBACK: НАШІ БОТИ
+# =========================================================
+
+@router.callback_query(
+    F.data == "our_bots"
+)
+async def our_bots_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    await callback.answer()
+
+    text = (
+        "🤖 <b>У нас ще є корисні проєкти для тебе:</b>\n\n"
+        "🎵 <a href=\"https://t.me/Yevibe_bot\"><b>Yevibe Bot — пошук музики</b></a> "
+        "— знайде музику за виконавцем, назвою пісні, голосовим повідомленням, "
+        "відео чи навіть кружечком друга чи подруги — просто надішли і одразу "
+        "отримаєш трек, який там грає!\n\n"
+        "🚌 <a href=\"https://t.me/menitudy_bot\"><b>Мені туди — маршрутки та зупинки</b></a> "
+        "— підкаже найближчу зупинку та потрібну маршрутку (навіть із пересадками), "
+        "щоб швидко дістатися місця призначення. Як Dozor, тільки значно зручніше "
+        "— просто напиши, звідки і куди їдеш!\n\n"
+        "🤫 <a href=\"https://t.me/+8ROwDs5cqV05MTMy\"><b>Канал анонімних зізнань та історій</b></a> "
+        "— свіжий формат на основі легендарних каналів із зізнаннями. Усе повністю "
+        "анонімно: можна виговоритися на повну й почитати треш-історії інших "
+        "(бувають фото та відео)."
+    )
+
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=our_bots_keyboard(),
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            raise
+
+
+# =========================================================
 # CALLBACK: ПОСЛАТИ РУСНЮ
 # =========================================================
 
@@ -3348,6 +3455,39 @@ async def send_rusnya_callback(
         main_keyboard(
             notifications_enabled
         )
+    )
+
+
+# =========================================================
+# CALLBACK: ЗАУВАЖЕННЯ ТА ПРОПОЗИЦІЇ
+# =========================================================
+
+@router.callback_query(
+    F.data == "feedback"
+)
+async def feedback_callback(
+    callback: CallbackQuery
+):
+
+    await track_user(
+        callback.from_user
+    )
+
+    await callback.answer()
+
+    text = (
+        "💡 <b>Зауваження та пропозиції</b>\n\n"
+        "Усі зауваження та пропозиції можете писати, "
+        "скинувши розробнику пару грн на чай "
+        "(пропозиції в коментарі / призначенні до платежу) 😁\n\n"
+        "💳 <b>Картка ПриватБанк:</b>\n"
+        "<code>4149609094866029</code>"
+    )
+
+    await safe_edit(
+        callback.message,
+        text,
+        feedback_keyboard()
     )
 
 
