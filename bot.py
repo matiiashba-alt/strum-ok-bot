@@ -3422,8 +3422,14 @@ async def our_bots_callback(
 
 
 # =========================================================
-# CALLBACK: ПОСЛАТИ РУСНЮ
+# CALLBACK: ПОСЛАТИ РУСНЮ (З ЕФЕКТАМИ У СТИЛІ TELEGRAM)
 # =========================================================
+
+RUSNYA_EFFECTS = [
+    "5046503158031339559",
+    "5107584321108051014",
+]
+
 
 @router.callback_query(
     F.data == "send_rusnya"
@@ -3436,7 +3442,7 @@ async def send_rusnya_callback(
         callback.from_user
     )
 
-    await callback.answer()
+    await callback.answer("🇺🇦🖕")
 
     user = await get_user(
         callback.from_user.id
@@ -3449,9 +3455,37 @@ async def send_rusnya_callback(
             user["notifications"]
         )
 
+    effect_text = (
+        "🖕 <b>Ок, шлемо нах*й!</b> 🇺🇦\n\n"
+        "Слава Україні! 💙💛"
+    )
+
+    sent_with_effect = False
+    for effect_id in RUSNYA_EFFECTS:
+        try:
+            await callback.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=effect_text,
+                message_effect_id=effect_id,
+            )
+            sent_with_effect = True
+            break
+        except Exception as error:
+            print(
+                "MESSAGE EFFECT FALLBACK:",
+                effect_id,
+                repr(error),
+                flush=True,
+            )
+
+    if not sent_with_effect:
+        await callback.message.answer(effect_text)
+
     await safe_edit(
         callback.message,
-        "🖕 <b>Ок, шлемо нах*й</b>",
+        "⚡ <b>Струм ОК</b>\n\n"
+        f"Ваша підчерга: <b>{user['queue'] if user and user['queue'] else '—'}</b>\n\n"
+        "Оберіть потрібний розділ:",
         main_keyboard(
             notifications_enabled
         )
